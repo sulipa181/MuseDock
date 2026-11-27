@@ -1,4 +1,4 @@
-# MuseDock 開發說明（v0.16）
+# MuseDock 開發說明（v0.17）
 
 一個 macOS 原生的小工具，把多個 Muse（muse.ai）帳號集中在同一個視窗裡切換，
 每個帳號各自擁有**完全隔離的 Cookie / 網站資料**，互不干擾。
@@ -7,7 +7,7 @@
 - 語言／工具鏈：Swift 6（`swiftc` 直編）、AppKit、WebKit、Carbon（全域熱鍵）、SQLite3（讀 Chrome cookie）
 - 產物：`MuseDock.app`（ad-hoc 簽章，本機執行）
 - 平台：macOS 14+ / arm64
-- 目前版本：`CFBundleShortVersionString 0.16`
+- 目前版本：`CFBundleShortVersionString 0.17`
 
 **目錄**：[1 專案結構](#1-專案結構)｜[2 架構總覽](#2-架構總覽)｜[3 資料模型](#3-資料模型)｜[4 核心流程](#4-核心流程)｜[5 UI 規格](#5-ui-規格)｜[6 選單列常駐](#6-選單列常駐)｜[7 踩過的坑](#7-踩過的坑改動前務必看)｜[8 診斷入口](#8-診斷與自測入口)｜[9 已知限制](#9-已知限制--技術債)｜[10 下一步](#10-建議下一步)｜[11 版本沿革](#11-版本沿革)｜[12 檢查清單](#12-接手檢查清單)
 
@@ -30,7 +30,8 @@
     ├── CHANGELOG-v0.13.md         v0.12 → v0.13 變更說明（單一實例鎖）
     ├── CHANGELOG-v0.14.md         v0.13 → v0.14 變更說明（省資源模式）
     ├── CHANGELOG-v0.15.md         v0.14 → v0.15 變更說明（卡片頭像）
-    └── CHANGELOG-v0.16.md         v0.15 → v0.16 變更說明（剪貼板 / 編輯選單）
+    ├── CHANGELOG-v0.16.md         v0.15 → v0.16 變更說明（編輯選單 / ⌘V 分發）
+    └── CHANGELOG-v0.17.md         v0.16 → v0.17 變更說明（輸入焦點 / 貼上路徑）
 ```
 
 執行期資料（不在 repo 內）：
@@ -602,6 +603,61 @@ PASTETEST token=MUSE-PASTE-9895 dispatched=true got=MUSE-PASTE-9895 result=PASS
 `NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)` → 讀回 `innerText` 比對。
 （`KEYTEST` 會自動在 3 秒後切到另一個帳號，所以一條日誌就能看到「切換前後」的對照。）
 
+### 4.12 輸入焦點與貼上路徑（v0.17）
+
+v0.16 讓 `⌘V` 能走到 `WKContentView`，但 `paste:` 只會貼到**有 DOM 焦點**的元素。
+切帳號或頁面重繪之後 `activeElement` 會退回 `<body>`，那時貼上「表面上有執行、實際什麼都沒發生」。
+
+實測 Muse 的輸入框是 **`<textarea>`**（不是 `contenteditable`），而且頁面自己有時會聚焦、有時不會；
+即使切過去時是好的，對話載完重繪後焦點又會掉。所以做兩層：
+
+#### (1) 切換後補焦點（體驗）
+
+```
+select(i) ─────────┐
+                   ├─ scheduleComposerFocus(for: i) → 1.5 秒後執行（同帳號只留最新一個）
+didFinish(nav) ────┘                               ↓ none / err → 3 秒後重試，最多三次
+```
+
+`composerJS` 的判斷順序（**不要改**）：
+
+| 狀況 | 回傳 | 為什麼 |
+|---|---|---|
+| 已經在 `contenteditable` / `textarea` / `input` | `already` | 連游標位置都不該動，否則打斷草稿 |
+| 使用者點在別的元素上 | `skip:user-active` | 正在選字／閱讀，搶焦點會讓人抓狂 |
+| 找不到任何候選 | `none` | 未登入或 SPA 還沒畫完 → 重試 |
+| 聚焦成功 | `focused` | 游標放文字末尾 |
+
+候選是 `[contenteditable="true"],[contenteditable=""],textarea,[role="textbox"]` 裡
+**面積最大**的可見元素（聊天介面只有一個 composer）。
+`focus({ preventScroll: true })` 是必要的，否則切回去頁面會跳到輸入框。
+
+#### (2) `⌘V` 自己確認落點（可靠）
+
+「編輯 → 貼上」不接原生 `paste:`，改接 `pasteIntoPage(_:)`：
+
+```swift
+// ⌘V → pasteIntoPage
+// ① 第一響應者不在 WebView（側欄改名、搜尋框）→ 原樣轉發，完全不干預
+// ② 在 WebView → pasteJS 先確保焦點在輸入框 → 再 forwardPaste()
+func forwardPaste() { NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil) }
+```
+
+`pasteJS` 與 `composerJS` 只差一行：**不檢查 `skip:user-active`**。
+自動補焦點是順手幫忙，按 `⌘V` 是明確要求，容忍度不同。
+
+#### 兩個時序坑
+
+| 坑 | 現象 | 正確做法 |
+|---|---|---|
+| 改完焦點立刻 paste | 內容貼到舊位置（`body`），等於沒貼 | 等 0.5 秒（0.15 秒不夠）；`already` 時 `wait = 0` 不讓使用者等 |
+| `<textarea>` 用 `Range` 設游標 | 無效，貼上的字插在草稿最前面 | `textarea`/`input` 用 `setSelectionRange(len, len)`，`contenteditable` 才用 `Range` |
+
+#### 關掉自動聚焦
+
+`MUSE_NO_AUTOFOCUS=1`：只關 (1)，`⌘V` 的落點確認仍然有效——
+也就是說，關掉之後你得先點一下輸入框，但貼上本身永遠不會失效。
+
 ---
 
 ## 5. UI 規格
@@ -664,6 +720,16 @@ PASTETEST token=MUSE-PASTE-9895 dispatched=true got=MUSE-PASTE-9895 result=PASS
     少了那張選單，`paste:` 永遠不會被發出去；再加上 `removeFromSuperview` 會讓
     `window.firstResponder` 退回視窗自己，兩層一起壞就是「看得到、貼不進去」（v0.16 修，見 §4.11）。
     右鍵選單是 WebKit 自己管的，會讓人誤判「複製正常」。
+15. **`⌘V` 送得到 ≠ 貼得上**：`paste:` 只認 DOM 焦點（`document.activeElement`）。
+    切帳號、頁面重繪都會讓它退回 `<body>`，此時 `paste:` 有執行但內容進不了任何輸入框。
+    v0.17 的解法是「按下的那一刻先確保焦點在 composer，再轉發」（見 §4.12），
+    不要試圖在切換時補一次就了事——Muse 載完對話會再重繪一次，補好的焦點會被吃掉。
+16. **JS 改完焦點不能立刻 `sendAction(paste:)`**：WebKit 的 `EditorState` 要一次 IPC 往返才更新，
+    太快的話內容會貼到舊位置。實測 0.15 秒不夠、0.5 秒可以。
+    另外 `textarea`/`input` 的游標要用 `setSelectionRange`，`createRange()` 只對 `contenteditable` 有效。
+17. **自測要走選單／回應鏈時，視窗必須是 key window**：`NSApp.sendAction(_:to:nil,from:)`
+    在非 key window 下找不到 `WKContentView`，回 `false`，很容易被誤判成「修壞了」。
+    `orderFrontRegardless()` 只保證畫出來，自測請用 `makeKeyAndOrderFront` + `activate`。
 
 ---
 
@@ -696,6 +762,7 @@ PASTETEST token=MUSE-PASTE-9895 dispatched=true got=MUSE-PASTE-9895 result=PASS
 | `MUSE_AUTOSTART=status\|on\|off` | 查詢／設定開機自動啟動（`SMAppService`），印出 status 後退出 |
 | `MUSE_START_SLOT=<slot>` | 啟動時直接選定該帳號 |
 | `MUSE_KEYTEST=1` | 自檢：切換帳號（3 秒後自動切另一個）時印 `KEYTEST`（⌘V 選單項在不在、第一響應者在不在 WebView），並在 9 秒時做一次真的貼上（`PASTETEST … result=PASS`）。見 §4.11 |
+| `MUSE_NO_AUTOFOCUS=1` | 切換帳號時不要把游標放進輸入框（`⌘V` 的落點確認仍然有效）。見 §4.12 |
 | `MUSE_AUTOLOGIN=1` | 探測時自動點「一鍵登入」卡片 |
 | `MUSE_SHOW=1` | 讓視窗真正顯示（headless 探測必加） |
 | `MUSE_PROBE_WAIT=<秒>` | 探測前等待時間（預設 8，建議 16） |
@@ -724,7 +791,7 @@ MUSE_SHOW=1 MUSE_CHROME_APPLY="Profile 15" MUSE_PROBE_WAIT=16 \
 | 簽章 | ad-hoc，無公證 | 換機器首次開啟需右鍵「打開」 |
 | 測試 | 無單元測試，只有 CLI 自測入口 | 改動靠人工驗證 |
 | 多實例 | v0.13 起用 `flock`（`instance.lock`）擋住；寫入型 CLI 直接拒絕 | 已解決。仍需注意：同一份 `accounts.json` 不要用兩個不同路徑的 App 同時開 |
-| 剪貼板 | v0.16 補上「編輯」選單並在切換時交還第一響應者 | 已解決 `⌘C`/`⌘V`；但被省資源釋放後重建的帳號，DOM 焦點會丟，切回去要重新點一下輸入框 |
+| 剪貼板 | v0.16 補「編輯」選單＋交還第一響應者；v0.17 補 DOM 焦點與 `⌘V` 落點確認 | 已解決。`⌘V` 在焦點被改過時多等 0.5 秒；`MUSE_NO_AUTOFOCUS=1` 可關自動聚焦 |
 
 ---
 
@@ -752,6 +819,7 @@ MUSE_SHOW=1 MUSE_CHROME_APPLY="Profile 15" MUSE_PROBE_WAIT=16 \
 | 0.14 | 省資源模式：切走的帳號閒置 10 分鐘後釋放 `WKWebView`（保留 storeID 與磁碟 cookie），切回自動重建仍登入 |
 | 0.15 | 卡片頭像：抽 AI 夥伴 `<video>` 的一幀（亮度掃包圍盒自適應裁切）存成 128×128 PNG，取代首字母；順手修掉「空指紋樣本覆寫既有樣本」的 bug；新增 `MUSE_WINDOW_FIT` 截圖輔助 |
 | 0.16 | 修「1 號複製、2 號貼不上」：補上「編輯」選單（⌘C/⌘V 靠 `keyEquivalent` 分發，缺了這張就永遠收不到），`select()` 改在換頁後 `makeFirstResponder(w)` 交還第一響應者；帳號選單修飾鍵改 `⇧⌘n`；新增 `MUSE_KEYTEST` 自檢（含真貼上驗證 `PASTETEST`） |
+| 0.17 | 修「`⌘V` 送到了卻貼不上」：切換帳號與頁面載入後自動把 DOM 游標放回 composer（`scheduleComposerFocus`），並把「貼上」改成 `pasteIntoPage`——按下時先確認焦點再轉發原生 `paste:`，焦點掉了也貼得上；`MUSE_IDLE_TEST` 擴成六段（含失焦到 body 後的貼上驗證）；新增 `MUSE_NO_AUTOFOCUS` |
 
 ---
 

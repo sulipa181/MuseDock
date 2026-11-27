@@ -689,6 +689,8 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
     /// 各 storeID 上次「嘗試」抓頭像的時間：失敗也記，否則每次 didFinish 都會重試
     var avatarAt: [String: Date] = [:]
     var cards: [AccountCard] = []
+    /// 每個帳號還沒執行的「補焦點」工作，用來去重
+    var focusWork: [String: DispatchWorkItem] = [:]
     var current: Int = 0
 
     let contentHost = CanvasView()
@@ -1274,6 +1276,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         scheduleAvatarCapture(for: index)
         window.title = "MuseDock — \(accounts[index].name)"
         statusLabel.stringValue = "⇧⌘\(index + 1) 切換 · \(accounts[index].name)"
+        scheduleComposerFocus(for: index)
         if KEYTEST {
             reportKeyRoute("idx=\(index) slot=\(accounts[index].slot) t=0")
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
@@ -1308,48 +1311,137 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
     /// 自檢：真的走一次貼上。造一個 contenteditable、把一段字塞進系統剪貼板，
     /// 再用 sendAction 從第一響應者沿回應鏈找 paste:——這正是選單分發 ⌘V 的路徑。
     /// 能貼進去才算真的修好了，光看 firstResponder 不算。
+    /// 自檢：真的走一次貼上。先備份剪貼板，結束後還原——不要毀掉使用者正在用的內容。
+    func pasteProbe(tag: String, _ completion: @escaping (Bool) -> Void) {
+        guard accounts.indices.contains(current), let w = webViews[accounts[current].storeID] else {
+            print("PASTETEST tag=\(tag) result=FAIL why=no-webview"); completion(false); return
+        }
+        let pb = NSPasteboard.general
+        let saved = pb.string(forType: .string)
+        let token = "MUSE-PASTE-\(Int.random(in: 1000...9999))"
+        pb.clearContents()
+        pb.setString(token, forType: .string)
+        func restoreClipboard() {
+            pb.clearContents()
+            if let saved { pb.setString(saved, forType: .string) }
+        }
+        let mk = """
+        (function(){
+          if (!document.body) return 'nobody';
+          var d = document.getElementById('__md_probe');
+          if (!d) {
+            d = document.createElement('div');
+            d.id = '__md_probe';
+            d.setAttribute('contenteditable', 'true');
+            d.style.cssText = 'position:fixed;left:6px;top:6px;width:260px;height:30px;'
+              + 'z-index:2147483647;outline:none;background:transparent;color:transparent;';
+            document.body.appendChild(d);
+          }
+          d.focus();
+          var r = document.createRange();
+          r.selectNodeContents(d); r.collapse(false);
+          var s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+          return document.activeElement === d ? 'focused' : 'nofocus';
+        })()
+        """
+        w.evaluateJavaScript(mk) { focusState, err in
+            guard (focusState as? String) == "focused" else {
+                restoreClipboard()
+                print("PASTETEST tag=\(tag) token=\(token) focus=\(focusState ?? "nil") err=\(err?.localizedDescription ?? "-") result=FAIL")
+                completion(false)
+                return
+            }
+            // 這一行就是「編輯 → 貼上」被按下時系統做的事
+            let dispatched = NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                w.evaluateJavaScript("(document.getElementById('__md_probe')||{}).innerText||''") { v, _ in
+                    restoreClipboard()
+                    let got = (v as? String) ?? ""
+                    let ok = got == token
+                    print("PASTETEST tag=\(tag) token=\(token) dispatched=\(dispatched) key=\(NSApp.keyWindow != nil) got=\(got.prefix(40)) result=\(ok ? "PASS" : "FAIL")")
+                    completion(ok)
+                }
+            }
+        }
+    }
+
     func pasteSelfTest(delay: Double) {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self else { return }
-            guard accounts.indices.contains(current),
-                  let w = webViews[accounts[current].storeID] else {
-                print("PASTETEST no webview"); return
+            self?.pasteProbe(tag: "keytest") { _ in }
+        }
+    }
+
+    /// 自檢：把 DOM 焦點打成 body（模擬頁面重繪後失焦），再走一次真正的
+    /// 「編輯 → 貼上」路徑（`pasteIntoPage`），看內容有沒有落到輸入框。
+    /// 用注入的透明 textarea 當落點，不去動真實帳號的 composer 草稿。
+    func pasteViaMenuProbe(tag: String, noBlur: Bool = false, _ completion: @escaping (Bool) -> Void) {
+        guard accounts.indices.contains(current), let w = webViews[accounts[current].storeID] else {
+            print("PASTEMENU tag=\(tag) result=FAIL why=no-webview"); completion(false); return
+        }
+        let pb = NSPasteboard.general
+        let saved = pb.string(forType: .string)
+        let token = "MUSE-MENU-\(Int.random(in: 1000...9999))"
+        let mk = """
+        (function(){
+          var d = document.getElementById('__md_ta');
+          if (!d) {
+            d = document.createElement('textarea');
+            d.id = '__md_ta';
+            d.style.cssText = 'position:fixed;left:0;top:0;width:900px;height:700px;'
+              + 'opacity:0.02;z-index:2147483646;border:0;padding:0;background:transparent;color:transparent;';
+            document.body.appendChild(d);
+          }
+          if (!\(noBlur ? "true" : "false") && document.activeElement && document.activeElement.blur) {
+            document.activeElement.blur();
+          }
+          if (\(noBlur ? "true" : "false")) d.focus();
+          return document.activeElement ? document.activeElement.tagName : 'nil';
+        })()
+        """
+        w.evaluateJavaScript(mk) { before, _ in
+            pb.clearContents()
+            pb.setString(token, forType: .string)
+            print("PASTEMENU tag=\(tag) after-blur=\(before ?? "nil")")
+            self.pasteIntoPage(nil)                 // ← 生產路徑：選單「貼上」
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                let read = """
+                (function(){
+                  var ta = document.getElementById('__md_ta');
+                  var el = document.querySelector('textarea,[contenteditable="true"],[role="textbox"]');
+                  var other = (el && el.id !== '__md_ta')
+                    ? String(el.value !== undefined ? el.value : el.innerText).slice(-60) : '';
+                  return JSON.stringify({ ta: ta ? ta.value.slice(-60) : '', other: other });
+                })()
+                """
+                w.evaluateJavaScript(read) { v, _ in
+                    pb.clearContents()
+                    if let saved { pb.setString(saved, forType: .string) }
+                    w.evaluateJavaScript("(function(){var e=document.getElementById('__md_ta'); if(e)e.remove();})()") { _, _ in }
+                    let raw = (v as? String) ?? ""
+                    let ok = raw.contains(token)
+                    print("PASTEMENU tag=\(tag) token=\(token) landed=\(ok) where=\(raw) result=\(ok ? "PASS" : "FAIL")")
+                    completion(ok)
+                }
             }
-            let token = "MUSE-PASTE-\(Int.random(in: 1000...9999))"
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(token, forType: .string)
-            let mk = """
-            (function(){
-              if (!document.body) return 'nobody';
-              var d = document.getElementById('__md_probe');
-              if (!d) {
-                d = document.createElement('div');
-                d.id = '__md_probe';
-                d.setAttribute('contenteditable', 'true');
-                d.style.cssText = 'position:fixed;left:6px;top:6px;width:260px;height:30px;'
-                  + 'z-index:2147483647;outline:none;background:transparent;color:transparent;';
-                document.body.appendChild(d);
-              }
-              d.focus();
-              var r = document.createRange();
-              r.selectNodeContents(d); r.collapse(false);
-              var s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
-              return document.activeElement === d ? 'focused' : 'nofocus';
-            })()
-            """
-            w.evaluateJavaScript(mk) { focusState, err in
-                guard let focusState = focusState as? String, focusState == "focused" else {
-                    print("PASTETEST token=\(token) focus=\(focusState ?? "nil") err=\(err?.localizedDescription ?? "-") result=FAIL")
-                    return
-                }
-                // 這一行就是「編輯 → 貼上」被按下時系統做的事
-                let dispatched = NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                    w.evaluateJavaScript("(document.getElementById('__md_probe')||{}).innerText||''") { v, _ in
-                        let got = (v as? String) ?? ""
-                        print("PASTETEST token=\(token) dispatched=\(dispatched) got=\(got.prefix(40)) result=\(got == token ? "PASS" : "FAIL")")
-                    }
-                }
+        }
+    }
+
+    /// 看 DOM 焦點現在停在哪：`input:…` 才算「可以直接貼」。
+    func probeFocus(_ completion: @escaping (String) -> Void) {
+        guard accounts.indices.contains(current), let w = webViews[accounts[current].storeID] else {
+            completion("no-webview"); return
+        }
+        let js = """
+        const ae = document.activeElement;
+        if (!ae) return 'no-active';
+        const tag = ae.tagName + (ae.isContentEditable ? '[ce]' : '');
+        return (ae.isContentEditable || /^(TEXTAREA|INPUT)$/.test(ae.tagName))
+          ? 'input:' + tag : 'other:' + tag;
+        """
+        w.callAsyncJavaScript(js, arguments: [:], in: nil, in: .page) { r in
+            switch r {
+            case .success(let v): completion((v as? String) ?? "?")
+            case .failure(let e): completion("err:\(e.localizedDescription.prefix(40))")
             }
         }
     }
@@ -1357,6 +1449,155 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
     func selectHotKey(_ n: Int) {
         guard let idx = accounts.firstIndex(where: { $0.slot == n }) else { return }
         select(idx)
+    }
+
+    // MARK: 輸入焦點（v0.17）
+
+    /// 把 DOM 焦點放回輸入框。`⌘V` 只認 DOM 焦點，光把 AppKit 的第一響應者
+    /// 交給 WebView 是不夠的：DOM 焦點停在 body 時，WebKit 會把內容貼進 body，
+    /// 看起來就是「沒反應」。聊天介面只有一個 composer，取面積最大的可見輸入區。
+    ///
+    /// 三種情況直接放行不搶：已經在輸入框、使用者已經點在別的元素上、
+    /// 頁面根本沒有輸入框（未登入／還在載入）。
+    let composerJS = """
+    return await (async () => {
+      const vis = e => {
+        const r = e.getBoundingClientRect();
+        if (r.width < 40 || r.height < 8) return false;
+        const s = getComputedStyle(e);
+        return s.visibility !== 'hidden' && s.display !== 'none' && Number(s.opacity || 1) > 0.01;
+      };
+      const ae = document.activeElement;
+      if (ae && (ae.isContentEditable || /^(TEXTAREA|INPUT)$/.test(ae.tagName))) return 'already';
+      if (ae && ae !== document.body && ae !== document.documentElement) return 'skip:user-active';
+      const sel = '[contenteditable="true"],[contenteditable=""],textarea,[role="textbox"]';
+      const cands = [...document.querySelectorAll(sel)].filter(vis);
+      if (!cands.length) return 'none';
+      const area = e => { const r = e.getBoundingClientRect(); return r.width * r.height; };
+      cands.sort((a, b) => area(b) - area(a));
+      const el = cands[0];
+      try { el.focus({ preventScroll: true }); } catch (_) { el.focus(); }
+      // 游標放末尾，不然貼上的字會插在既有內容最前面
+      try {
+        const r = document.createRange();
+        r.selectNodeContents(el); r.collapse(false);
+        const s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+      } catch (_) {}
+      const back = document.activeElement;
+      return (back === el || el.contains(back)) ? 'focused' : 'focus-failed';
+    })();
+    """
+
+    /// 跟 `composerJS` 只差一件事：這裡是使用者**主動按 ⌘V**，意圖明確，
+    /// 所以「已經點在別的元素上」也照樣搶回輸入框；其餘判斷完全一樣。
+    let pasteJS = """
+    return await (async () => {
+      const vis = e => {
+        const r = e.getBoundingClientRect();
+        if (r.width < 40 || r.height < 8) return false;
+        const s = getComputedStyle(e);
+        return s.visibility !== 'hidden' && s.display !== 'none' && Number(s.opacity || 1) > 0.01;
+      };
+      const ae = document.activeElement;
+      if (ae && (ae.isContentEditable || /^(TEXTAREA|INPUT)$/.test(ae.tagName))) return 'already';
+      const sel = '[contenteditable="true"],[contenteditable=""],textarea,[role="textbox"]';
+      const cands = [...document.querySelectorAll(sel)].filter(vis);
+      if (!cands.length) return 'none';
+      const area = e => { const r = e.getBoundingClientRect(); return r.width * r.height; };
+      cands.sort((a, b) => area(b) - area(a));
+      const el = cands[0];
+      try { el.focus({ preventScroll: true }); } catch (_) { el.focus(); }
+      try {
+        if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
+          el.setSelectionRange(el.value.length, el.value.length);
+        } else {
+          const r = document.createRange();
+          r.selectNodeContents(el); r.collapse(false);
+          const s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+        }
+      } catch (_) {}
+      const back = document.activeElement;
+      const rc = el.getBoundingClientRect();
+      const desc = el.tagName + (el.id ? '#' + el.id : '')
+        + ' ' + Math.round(rc.width) + 'x' + Math.round(rc.height);
+      return ((back === el || el.contains(back)) ? 'focused ' : 'focus-failed ') + desc;
+    })();
+    """
+
+    /// `⌘V` 的真正入口。
+    ///
+    /// WebKit 只把內容貼到「有 DOM 焦點」的元素；切換帳號或頁面重繪之後
+    /// `activeElement` 會退回 `<body>`，那時 `paste:` 表面上有執行、實際上什麼都沒發生。
+    /// 與其去猜「什麼時候會掉焦點」，不如在按下的這一刻先確保游標在輸入框，再原樣轉發
+    /// `paste:`——這條路徑與使用者手動點輸入框再按 ⌘V 完全等價。
+    @objc func pasteIntoPage(_ sender: Any?) {
+        var insideWeb = false
+        var cur = window.firstResponder as? NSView
+        while let v = cur {
+            if v is WKWebView { insideWeb = true; break }
+            cur = v.superview
+        }
+        // 焦點不在網頁裡（側欄改名、搜尋框等原生控件）→ 一個字都不干預
+        guard insideWeb, accounts.indices.contains(current),
+              let w = webViews[accounts[current].storeID] else {
+            forwardPaste(); return
+        }
+        var forwarded = false
+        func forwardOnce() {
+            guard !forwarded else { return }
+            forwarded = true
+            forwardPaste()
+        }
+        w.callAsyncJavaScript(pasteJS, arguments: [:], in: nil, in: .page) { r in
+            var wait = 0.5
+            switch r {
+            case .success(let v):
+                let state = (v as? String) ?? "?"
+                print("PASTE_ROUTE name=\(self.accounts[self.current].name) focus=\(state)")
+                // 焦點本來就在輸入框 → EditorState 是對的，立刻貼，不讓使用者等
+                if state.hasPrefix("already") { wait = 0 }
+            case .failure(let e):
+                print("PASTE_ROUTE name=\(self.accounts[self.current].name) js=\(e.localizedDescription.prefix(40))")
+            }
+            // 剛改過焦點的話，WebKit 內部的 EditorState 要一次 IPC 往返才跟上；
+            // 立刻 paste: 會貼到舊位置（實測 0.15s 不夠、0.5s 可以）
+            DispatchQueue.main.asyncAfter(deadline: .now() + wait) { forwardOnce() }
+        }
+        // 頁面正在換頁時 JS 可能不回來，別讓 ⌘V 卡住
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { forwardOnce() }
+    }
+
+    func forwardPaste() {
+        NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)
+    }
+
+    /// 重建的帳號要等 SPA 把 composer 畫出來，所以第一次 1.5 秒、之後各隔 3 秒，
+    /// 最多三次；`none`（還沒有輸入框）與載入中的錯誤才重試，其餘狀態都算終局。
+    func scheduleComposerFocus(for index: Int, attempt: Int = 0) {
+        guard !DEMO, !NO_AUTOFOCUS else { return }
+        guard accounts.indices.contains(index) else { return }
+        let storeID = accounts[index].storeID
+        // select 與 didFinish 會各排一次，同一帳號只留最新那個，否則日誌會出現
+        // 兩三條同時抵達的 FOCUS，看不出哪次才是有效的
+        if attempt == 0 { focusWork[storeID]?.cancel() }
+        let delay: Double = attempt == 0 ? 1.5 : 3.0
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, accounts.indices.contains(self.current), self.current == index,
+                  let w = self.webViews[storeID], w.window != nil else { return }
+            w.callAsyncJavaScript(self.composerJS, arguments: [:], in: nil, in: .page) { r in
+                let state: String
+                switch r {
+                case .success(let v): state = (v as? String) ?? "?"
+                case .failure(let e): state = "err:\(e.localizedDescription.prefix(50))"
+                }
+                print("FOCUS name=\(self.accounts[index].name) attempt=\(attempt) state=\(state)")
+                if (state == "none" || state.hasPrefix("err")), attempt < 2 {
+                    self.scheduleComposerFocus(for: index, attempt: attempt + 1)
+                }
+            }
+        }
+        focusWork[storeID] = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     // MARK: 省資源（閒置釋放）
@@ -1406,15 +1647,34 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
     /// 開 1 號 → 切到 2 號 → 等門檻過去，1 號的 WebView 應該被釋放、2 號留下。
     func runIdleTest() {
         guard accounts.count >= 2 else { print("IDLE_TEST need two accounts"); exit(9) }
-        window.orderFrontRegardless()          // 要真的可見，WKWebView 才會載入
+        // 自測要走真實路徑（選單 → 回應鏈），所以視窗必須是 key；
+        // 只 orderFront 的話 NSApp.sendAction 找不到 WKContentView，會誤判成「貼不上」。
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            print("IDLE_TEST window key=\(self.window.isKeyWindow) appActive=\(NSApp.isActive)")
+        }
         select(0)
         print("IDLE_TEST step1 select=\(accounts[0].name)")
 
+        // 段 A：沒被釋放的情況下切走再切回，DOM 焦點會不會掉？
+        // 這一格決定「每次切換都要補焦點」還是「只有重建才要」。
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+            self.probeFocus { s in
+                print("IDLE_TEST focus1 name=\(self.accounts[0].name) after-select=\(s)")
+            }
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
             print("IDLE_TEST step2 switch=\(self.accounts[1].name) webViews=\(self.webViews.count)")
             self.select(1)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + self.idleReleaseAfter + 20) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 22) {
+            self.probeFocus { s in
+                print("IDLE_TEST focus2 name=\(self.accounts[1].name) after-switch=\(s)")
+            }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + self.idleReleaseAfter + 25) {
             let names = self.webViews.keys.compactMap { id in
                 self.accounts.first(where: { $0.storeID == id })?.name
             }
@@ -1431,7 +1691,22 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                 let back = self.lastProbe[self.accounts[0].storeID] == true
                 print("IDLE_TEST rehydrate name=\(self.accounts[0].name) loggedIn=\(String(describing: self.lastProbe[self.accounts[0].storeID])) webViews=\(self.webViews.count)")
                 print("IDLE_TEST result2 \(back ? "PASS" : "FAIL")（重建後仍登入）")
-                exit((released && back) ? 0 : 7)
+                self.probeFocus { s in
+                    print("IDLE_TEST focus3 name=\(self.accounts[0].name) after-rehydrate=\(s)")
+                    let focused = s.hasPrefix("input:")
+                    print("IDLE_TEST result3 \(focused ? "PASS" : "FAIL")（重建後游標已在輸入框）")
+                    self.pasteProbe(tag: "rehydrate") { ok in
+                        print("IDLE_TEST result4 \(ok ? "PASS" : "FAIL")（重建後直接 ⌘V 貼得上）")
+                        // 再把焦點打成 body（頁面重繪後就是這樣），走一次真正的選單路徑
+                        self.pasteViaMenuProbe(tag: "body-focus") { menuOK in
+                            print("IDLE_TEST result5 \(menuOK ? "PASS" : "FAIL")（失焦到 body 後 ⌘V 仍貼得上）")
+                            self.pasteViaMenuProbe(tag: "already-focus", noBlur: true) { fastOK in
+                                print("IDLE_TEST result6 \(fastOK ? "PASS" : "FAIL")（焦點已在輸入框時直接貼）")
+                                exit((released && back && focused && ok && menuOK && fastOK) ? 0 : 7)
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1557,7 +1832,10 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         editMenu.addItem(.separator())
         editMenu.addItem(withTitle: "剪下", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
         editMenu.addItem(withTitle: "複製", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
-        editMenu.addItem(withTitle: "貼上", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        // 貼上不直接交給 WKContentView，理由見 pasteIntoPage(_:)
+        let pasteItem = NSMenuItem(title: "貼上", action: #selector(pasteIntoPage(_:)), keyEquivalent: "v")
+        pasteItem.target = self
+        editMenu.addItem(pasteItem)
         editMenu.addItem(withTitle: "全選", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editItem.submenu = editMenu
 
@@ -2266,6 +2544,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
             scheduleFingerprint(for: idx)
             scheduleLoginProbe(for: idx)
             scheduleAvatarCapture(for: idx)
+            scheduleComposerFocus(for: idx)   // 頁面載完才有 composer，這裡再試一次
         }
         if AVATAR_SLOT != nil && !avatarFired && webView.url?.host?.contains("muse.ai") == true {
             avatarFired = true
@@ -2666,6 +2945,8 @@ let WHO_SLOT = Int(ProcessInfo.processInfo.environment["MUSE_WHO"] ?? "")
 let AVATAR_SLOT = Int(ProcessInfo.processInfo.environment["MUSE_AVATAR_PROBE"] ?? "")
 /// 自檢：切換帳號後印出「⌘V 有沒有選單項接、第一響應者在不在 WebView 裡」
 let KEYTEST = ProcessInfo.processInfo.environment["MUSE_KEYTEST"] == "1"
+/// 不想讓切換帳號時自動把游標放進輸入框，就設這個
+let NO_AUTOFOCUS = ProcessInfo.processInfo.environment["MUSE_NO_AUTOFOCUS"] == "1"
 var importFired = false
 var avatarFired = false
 
