@@ -1,10 +1,52 @@
 # 變更說明：v0.16 → v0.17
 
 - 日期：2026-11-27
-- 範圍：`main.swift`（新增 `composerJS` / `pasteJS` / `scheduleComposerFocus` / `pasteIntoPage` / `probeFocus` / `pasteViaMenuProbe`；`MUSE_IDLE_TEST` 擴成六段）、`build.sh`（版本號）、`docs/DEVELOPER.md`（新增 §4.12、坑 15、坑 16）
+- 讀者：**開發**。給使用者的版本在 [UPDATE-v0.17.md](UPDATE-v0.17.md)，內容等價但不含程式細節
+- 範圍：`main.swift`（+367 / −50）、`build.sh`（版本號）、`docs/DEVELOPER.md`（+76）——逐項見 §0
 - 是否影響既有資料：**不影響**
 - 是否需重新登入：**不需要**
 - 版本號：`CFBundleShortVersionString` 0.16 → **0.17**
+
+---
+
+## 0. 檔案與符號變更
+
+```
+README.md                |   4 +-      文件索引
+build.sh                 |   2 +-      版本號 0.16 → 0.17
+docs/CHANGELOG-v0.17.md  | 163 +++     本文件
+docs/UPDATE-v0.17.md     | 新增        使用者向更新說明
+docs/DEVELOPER.md        |  76 +++     §4.12、坑 15–17、§8 變數、§9、§11
+main.swift               | 367 ++++--  全部實作（3119 行）
+```
+
+新增／改寫的符號（行號以 v0.17 的 `main.swift` 為準，會隨改動漂移，用名字找）：
+
+| 符號 | 位置 | 職責 |
+|---|---|---|
+| `focusWork: [String: DispatchWorkItem]` | L693 | 每個帳號尚未執行的補焦點工作，用來去重 |
+| `composerJS` | L1462 | 探測並（必要時）聚焦，回 `already` / `skip:user-active` / `none` / `focused <描述>` |
+| `pasteJS` | L1493 | 與 `composerJS` 同構，**不檢查 `skip:user-active`** |
+| `pasteIntoPage(_:)` | L1533 | 「編輯 → 貼上」的 action，v0.16 的原生 `paste:` 被換掉 |
+| `forwardPaste()` | L1570 | `NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)` |
+| `scheduleComposerFocus(for:attempt:)` | L1576 | 1.5 秒後執行，`none`／`err` 再隔 3 秒重試，最多三次 |
+| `probeFocus(_:)` | L1430 | 讀 `document.activeElement`，回 `input:…` / `other:…` / `no-webview` |
+| `pasteProbe(tag:)` | L1315 | 注入 `contenteditable` + 真 `sendAction`，驗證 DOM 路徑貼得上 |
+| `pasteViaMenuProbe(tag:noBlur:)` | L1377 | 走 `pasteIntoPage`，落點用注入的透明 `textarea` 驗證 |
+| `runIdleTest()` | L1648 | 由兩段擴成六段，全 PASS 才 `exit 0` |
+| `NO_AUTOFOCUS` | L2949 | `MUSE_NO_AUTOFOCUS=1`，只關自動聚焦 |
+
+呼叫點只有兩處，兩者覆蓋不同時機，缺一都會漏：
+
+| 呼叫點 | 覆蓋的時機 |
+|---|---|
+| `select(i)` L1279 | WebView 已存在、只是換頁導致焦點掉回 `body` |
+| `webView(_:didFinish:)` L2547 | 重建後 SPA 才把 composer 畫出來 |
+
+`composerJS` / `pasteJS` 是 `let` 常數而非每帳號一份：字串只在啟動時建一次，
+`callAsyncJavaScript` 每次呼叫本來就會重新解析，所以不需要快取 DOM 參照。
+每次都重新查詢 DOM 是刻意的——頁面重繪後節點會換人，握著舊參照等於對著空氣操作；
+`scheduleAvatarCapture` 也是同樣寫法（每次重試都重新 `querySelectorAll('video')`）。
 
 ---
 
@@ -138,7 +180,56 @@ IDLE_TEST result6 PASS（焦點已在輸入框時直接貼）
 
 ---
 
-## 5. 風險與回滾
+## 5. 行為差異（升級後會看到的變化）
+
+### 5.1 `⌘V` 不再是一條直線
+
+| | v0.16 | v0.17 |
+|---|---|---|
+| 路徑 | `paste:` → `WKContentView` | `pasteIntoPage` → `pasteJS`（一次 IPC）→ `forwardPaste` → `paste:` |
+| 焦點不在輸入框 | 內容進 `body`，靜默失敗 | 先聚焦，0.5 秒後貼進輸入框 |
+| 延遲 | 0 | 0（`already`）／0.5 秒（剛改過焦點） |
+| JS 無回應 | — | 1.5 秒兜底，一定轉發，不會卡住 |
+
+**副作用要記住**：`paste:` 的來源從「選單直接發」變成「JS 回來後發」，
+所以在網頁正在換頁的那 1.5 秒內按 `⌘V`，貼上的時機會比按鍵晚一點。
+這是刻意的取捨——寧可慢半秒，也不要靜默失敗。
+
+### 5.2 切換帳號會主動改變游標位置
+
+切過去 1.5 秒後，如果 composer 已存在且你沒點在別處，游標會被放到文字末尾。
+`preventScroll` 保證頁面不會因此滾動，但對某些使用者來說「游標自己跑進輸入框」
+仍然是可感知的行為改變，這是 `MUSE_NO_AUTOFOCUS` 存在的原因。
+
+### 5.3 新增四種日誌前綴
+
+| 前綴 | 格式 | 什麼時候印 |
+|---|---|---|
+| `FOCUS` | `FOCUS name=… attempt=0 state=already` | 每次 `scheduleComposerFocus` 執行後 |
+| `PASTE_ROUTE` | `PASTE_ROUTE name=… focus=focused TEXTAREA#__md_ta 900x700` | 每次 `⌘V` |
+| `PASTEMENU` | `PASTEMENU tag=… token=… landed=true where={…} result=PASS` | 自測走選單路徑時 |
+| `PASTETEST` | `PASTETEST tag=… token=… dispatched=true key=true got=… result=PASS` | 自測走 DOM 路徑時 |
+
+`PASTE_ROUTE` 的 `focus=` 後面會帶元素描述（`tag#id 寬x高`），
+出問題時這一行就能判斷是「貼到錯的元素」還是「根本沒聚焦」。
+
+### 5.4 `MUSE_IDLE_TEST` 的退出碼
+
+| 退出碼 | 意義 |
+|---|---|
+| `0` | 六段全 PASS |
+| `7` | 有任一段 FAIL（含 `result1`–`result6`） |
+| `9` | 帳號不足兩個，無法測釋放 |
+
+### 5.5 內部重構（對外無感）
+
+`pasteSelfTest(delay:)` 拆成 `pasteProbe(tag:)`（本體，帶完成回呼）＋薄包裝，
+因為自測需要在同一個流程裡依序跑三次不同條件的貼上。`MUSE_KEYTEST` 的行為不變
+（仍印 `PASTETEST tag=keytest`）。
+
+---
+
+## 6. 風險與回滾
 
 | 風險 | 說明 | 緩解 |
 |---|---|---|
@@ -153,7 +244,53 @@ IDLE_TEST result6 PASS（焦點已在輸入框時直接貼）
 
 ---
 
-## 6. 仍未處理
+## 7. 被否掉的方案
+
+留給下一個想「簡化」這塊的人——這些都試過或推演過，不是漏掉的。
+
+| 方案 | 為什麼不用 |
+|---|---|
+| 監聽 DOM 的 `focus` / `blur` / `focusout` 補焦點 | SPA 每次重繪都會觸發一輪，會在使用者捲動、選字時搶焦點；而且焦點掉到 `body` 時這些事件在 `document` 上收得到、卻無法判斷「該不該補」 |
+| 用 `document.execCommand('insertText')` 直接寫入剪貼板內容 | 等於自己接管編輯：圖片、富文本、undo stack、輸入法組字全部要重做。原生 `paste:` 這些都是免費的 |
+| 在 WebView 層攔 `keyDown` 自己處理 `⌘V` | 要繞過 `keyEquivalent` 機制、還要自己判斷輸入法狀態；選單項 + `keyEquivalent` 是 macOS 的正規做法（v0.16 已確立） |
+| 每次貼上都固定等 0.5 秒 | 正常打字時白等半秒。用 `already` 分流後，只有剛修過焦點才等 |
+| 用 `MutationObserver` 盯 composer 出現 | 常駐 observer 在長對話頁面成本不低，而且解決不了「焦點被別的東西搶走」——那才是真正的失敗模式 |
+| 等 WebKit 的某個「編輯器就緒」事件再貼 | 沒有這種公開事件。0.5 秒是量測出來的經驗值，收成常數並寫在這裡，不要散落到各處 |
+| 把 `paste:` 的轉發延遲做成可設定 | 使用者不該為這種內部時序負責；出問題時應該是我們調，不是他調 |
+
+---
+
+## 8. 回歸清單（動這塊程式之前先跑）
+
+```bash
+# 1. 建置
+./build.sh
+
+# 2. 六段自測（真實帳號；15 秒加速版）
+MUSE_IDLE_TEST=1 MUSE_IDLE_RELEASE_SEC=15 /Applications/MuseDock.app/Contents/MacOS/MuseDock
+#    期望：result1–result6 全 PASS、exit 0
+
+# 3. 鍵盤路徑（假資料，不動真實帳號）
+rm -rf /tmp/md-keytest && mkdir -p /tmp/md-keytest
+MUSE_STATE_DIR=/tmp/md-keytest MUSE_KEYTEST=1 MUSE_DEMO=1 MUSE_START_SLOT=1 \
+  ./MuseDock.app/Contents/MacOS/MuseDock
+#    期望：KEYTEST pasteMenu=OK inWebView=true responder=WKWebView
+#          PASTETEST dispatched=true result=PASS
+```
+
+手動三項（自測取代不了）：
+
+1. 1 號選字 `⌘C`（**不用右鍵**）→ `⇧⌘2` → 不點任何地方直接 `⌘V`
+2. 側欄「改名」的原生輸入框裡 `⌘V` → 應貼在原生框，`PASTE_ROUTE` 不該出現
+3. 剪貼板放一張圖 → 在 2 號 `⌘V` → 應貼成圖片（`pasteJS` 只動焦點、不碰內容）
+
+**只改一個值的注意事項**：若調整 `pasteIntoPage` 裡的 `0.5`，必須重跑
+`PASTEMENU tag=body-focus`（它模擬失焦到 `body`）。這是唯一能驗出
+「貼到舊位置」的測試；`result6`（`already-focus`）測不出來，因為那條路 `wait = 0`。
+
+---
+
+## 9. 仍未處理
 
 1. **熱鍵可自訂**：目前固定 `⇧⌘1–9`
 2. **匯入前預檢重複**
