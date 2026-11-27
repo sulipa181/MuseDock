@@ -85,7 +85,7 @@ WebKit 只貼給「有游標焦點」的元素
 
 ```bash
 launchctl setenv MUSE_NO_AUTOFOCUS 1
-osascript -e 'quit app "MuseDock"'; open -a MuseDock
+pkill -x MuseDock; sleep 1; open -a MuseDock
 ```
 
 （`open` 不會把環境變數傳給 App，所以要交給 `launchd`。想還原：`launchctl unsetenv MUSE_NO_AUTOFOCUS`。）
@@ -107,12 +107,23 @@ osascript -e 'quit app "MuseDock"'; open -a MuseDock
 ## 升級
 
 ```bash
-cd MuseDock && git pull && ./build.sh
+pkill -x MuseDock      # ① 先結束舊的
+cd ~/MuseDock && git pull && ./build.sh # ② 重建
+open -a MuseDock                        # ③ 開新的
 ```
+
+① 不能省：舊的還在跑就會握著 `instance.lock`，新啟動的行程搶不到鎖，
+只會把舊視窗叫回然後安靜結束——你會以為更新沒生效。`build.sh` 現在會提醒這件事。
 
 `accounts.json` 格式沒有變動，**不需要重新登入**，頭像快取也不用重抓。
 
-想退回上一版：換回 v0.16 的 `.app` 即可，資料不受影響。
+想退回上一版：
+
+```bash
+pkill -x MuseDock
+cd ~/MuseDock && git checkout v0.16 && ./build.sh && open -a MuseDock
+# 回到最新：git checkout main
+```
 
 ---
 

@@ -47,17 +47,30 @@
 | [docs/UPDATE-v0.17.md](docs/UPDATE-v0.17.md) | **使用者** | 改了什麼、為什麼貼不上（流程圖）、10 秒自檢、升級與回滾 |
 | [docs/CHANGELOG-v0.17.md](docs/CHANGELOG-v0.17.md) | **開發** | 符號與呼叫點、兩層修法、兩個時序坑、六段自測、被否掉的方案、回歸清單 |
 
-升級（`accounts.json` 沒有變動，**不需要重新登入**）：
+**升級**（`accounts.json` 沒有變動，**不需要重新登入**）：
 
 ```bash
-cd MuseDock && git pull && ./build.sh
+pkill -x MuseDock      # ① 一定要先結束，否則新版只是躺在磁碟上
+cd ~/MuseDock && git pull && ./build.sh # ② 重建並同步到 /Applications
+open -a MuseDock                        # ③ 開新版
+```
+
+> 少了 ① 會踩一個很悶的坑：舊實例還握著 `instance.lock`，新啟動的行程搶不到鎖，
+> 只會叫回舊視窗然後 `exit(0)`——看起來像「更新沒生效」。`build.sh` 會在這種時候出聲提醒。
+
+**回滾**：
+
+```bash
+pkill -x MuseDock
+cd ~/MuseDock && git checkout v0.16 && ./build.sh && open -a MuseDock
+# 回到最新：git checkout main
 ```
 
 不想切過去游標就跳進輸入框（`open` 不會把環境變數傳給 App，要用 `launchctl`）：
 
 ```bash
 launchctl setenv MUSE_NO_AUTOFOCUS 1   # 之後每次啟動都生效
-osascript -e 'quit app "MuseDock"'; open -a MuseDock
+pkill -x MuseDock; sleep 1; open -a MuseDock
 launchctl unsetenv MUSE_NO_AUTOFOCUS   # 想還原
 ```
 
@@ -130,7 +143,7 @@ build.sh                 編譯、打包、簽章、安裝
 tools/draw_icon.py       程式化繪製 App 圖示
 docs/UPDATE-v0.17.md     使用者向更新說明
 docs/CHANGELOG-*.md      各版本開發向變更說明
-docs/DEVELOPER.md        開發說明（架構、流程、踩過的坑、17 條坑、自測入口）
+docs/DEVELOPER.md        開發說明（架構、流程、踩過的坑、18 條坑、自測入口）
 docs/screenshot-demo.png 示範截圖（假資料，非真實帳號）
 ```
 
@@ -144,7 +157,7 @@ docs/screenshot-demo.png 示範截圖（假資料，非真實帳號）
 
 **開發向**
 
-- [docs/DEVELOPER.md](docs/DEVELOPER.md) — 接手前先看：資料模型、七個核心流程、17 條踩坑紀錄、§8 診斷與自測入口
+- [docs/DEVELOPER.md](docs/DEVELOPER.md) — 接手前先看：資料模型、七個核心流程、18 條踩坑紀錄、§8 診斷與自測入口
 - [docs/CHANGELOG-v0.17.md](docs/CHANGELOG-v0.17.md) — v0.17：輸入焦點與貼上路徑（含被否掉的方案、回歸清單）
 
 **沿革**

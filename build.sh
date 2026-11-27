@@ -51,3 +51,14 @@ if [[ -w /Applications ]]; then
   cp -R "$APP" "/Applications/MuseDock.app" 2>/dev/null \
     && echo "✓ 已同步到 /Applications/MuseDock.app"
 fi
+
+# 舊實例還在跑的話，新版只寫到磁碟、記憶體裡仍是舊的；
+# 而且下次啟動會被單一實例鎖擋下（SINGLE_INSTANCE already running → 叫回舊視窗），
+# 看起來就像「更新沒生效」——所以這裡一定要講出來。
+RUNNING="$(pgrep -x MuseDock 2>/dev/null || true)"
+if [[ -n "$RUNNING" ]]; then
+  echo ""
+  echo "⚠️  MuseDock 正在執行（pid ${RUNNING//$'\n'/, }）——磁碟上是新版，執行中的還是舊版。"
+  echo "    ⌘Q 結束後再開才會換過來；直接開會被單一實例鎖擋下，只會叫回舊視窗。"
+  echo "    一步到位：pkill -x MuseDock; sleep 1; open -a MuseDock"
+fi

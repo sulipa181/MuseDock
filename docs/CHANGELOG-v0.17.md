@@ -240,7 +240,20 @@ IDLE_TEST result6 PASS（焦點已在輸入框時直接貼）
 | 原生控件受影響 | 側欄改名等原生文字框 | `pasteIntoPage` 先看第一響應者在不在 WebView 裡，不在就原樣轉發 |
 | 貼圖失效 | `pasteJS` 只處理焦點，不碰內容 | 內容仍由原生 `paste:` 插入，富文本／圖片照舊 |
 
-回滾：換回 v0.16 的 `.app`。`accounts.json` 無變動。
+升級與回滾都必須**先結束執行中的實例**——舊行程握著 `instance.lock`，
+新行程搶不到鎖就只會叫回舊視窗並 `exit(0)`（`SINGLE_INSTANCE already running`），
+磁碟上的新版永遠不會被載入。`build.sh` 已會在偵測到執行中實例時出聲提醒。
+
+```bash
+# 升級
+pkill -x MuseDock
+cd ~/MuseDock && git pull && ./build.sh && open -a MuseDock
+
+# 回滾（accounts.json 無變動，資料不受影響）
+pkill -x MuseDock
+cd ~/MuseDock && git checkout v0.16 && ./build.sh && open -a MuseDock
+# 回到最新：git checkout main
+```
 
 ---
 

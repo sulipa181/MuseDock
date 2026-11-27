@@ -19,7 +19,7 @@
 ~/MuseDock/
 ├── main.swift            2726 行   全部 UI + Controller + 診斷入口
 ├── ChromeCookies.swift    313 行   Chrome Profile 掃描與 cookie 解密
-├── build.sh                53 行   編譯、打包 Info.plist、簽章、同步到 /Applications
+├── build.sh                64 行   編譯、打包 Info.plist、簽章、同步到 /Applications、提醒執行中實例
 ├── AppIcon.icns / .png            程式化繪製的圖示（10 個尺寸）
 ├── tools/
 │   └── draw_icon.py       181 行   PIL 4096px 超取樣繪製圖示
@@ -50,7 +50,11 @@ cd ~/MuseDock && ./build.sh
 ```
 
 做的事：`rm -rf MuseDock.app` → 編譯 `main.swift ChromeCookies.swift` → 寫 `Info.plist`
-→ 打包 `AppIcon.icns` → `codesign -s -`（ad-hoc，失敗不中斷）→ `cp -R` 到 `/Applications`。
+→ 打包 `AppIcon.icns` → `codesign -s -`（ad-hoc，失敗不中斷）→ `cp -R` 到 `/Applications`
+→ 若偵測到執行中的 `MuseDock`，印出警告（**只提醒，不動它**）。
+
+> 為什麼要提醒：`cp -R` 只換磁碟上的檔案，已在跑的行程仍是舊的；而單一實例鎖會讓
+> 下一次啟動 `exit(0)` 去叫回舊視窗，使用者會以為「更新沒生效」。見 §4.8 與坑 18。
 
 編譯旗標（改動前先看）：
 
@@ -731,6 +735,12 @@ func forwardPaste() { NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, fro
 17. **自測要走選單／回應鏈時，視窗必須是 key window**：`NSApp.sendAction(_:to:nil,from:)`
     在非 key window 下找不到 `WKContentView`，回 `false`，很容易被誤判成「修壞了」。
     `orderFrontRegardless()` 只保證畫出來，自測請用 `makeKeyAndOrderFront` + `activate`。
+18. **重建不會換掉正在跑的行程**：`./build.sh` 只覆寫磁碟上的 `.app`，已在執行的行程還是舊二進位。
+    加上 v0.13 的單一實例鎖，下一次啟動會 `SINGLE_INSTANCE already running` → 叫回舊視窗 → `exit(0)`，
+    使用者看到的仍是舊版，於是回報「更新沒生效」。**驗證新版前一定要先結束舊實例**：
+    `pkill -x MuseDock`（`osascript -e 'quit app "MuseDock"'` 需要 TCC 自動化授權，
+    未授權時回 `-10004 越權取用`，不要寫進文件當標準做法）。
+    `build.sh` 偵測到執行中實例時會印警告，但**不會**替你結束它。
 
 ---
 
