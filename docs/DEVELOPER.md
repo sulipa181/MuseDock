@@ -1,4 +1,4 @@
-# MuseDock 開發說明（v0.15）
+# MuseDock 開發說明（v0.16）
 
 一個 macOS 原生的小工具，把多個 Muse（muse.ai）帳號集中在同一個視窗裡切換，
 每個帳號各自擁有**完全隔離的 Cookie / 網站資料**，互不干擾。
@@ -7,7 +7,7 @@
 - 語言／工具鏈：Swift 6（`swiftc` 直編）、AppKit、WebKit、Carbon（全域熱鍵）、SQLite3（讀 Chrome cookie）
 - 產物：`MuseDock.app`（ad-hoc 簽章，本機執行）
 - 平台：macOS 14+ / arm64
-- 目前版本：`CFBundleShortVersionString 0.15`
+- 目前版本：`CFBundleShortVersionString 0.16`
 
 **目錄**：[1 專案結構](#1-專案結構)｜[2 架構總覽](#2-架構總覽)｜[3 資料模型](#3-資料模型)｜[4 核心流程](#4-核心流程)｜[5 UI 規格](#5-ui-規格)｜[6 選單列常駐](#6-選單列常駐)｜[7 踩過的坑](#7-踩過的坑改動前務必看)｜[8 診斷入口](#8-診斷與自測入口)｜[9 已知限制](#9-已知限制--技術債)｜[10 下一步](#10-建議下一步)｜[11 版本沿革](#11-版本沿革)｜[12 檢查清單](#12-接手檢查清單)
 
@@ -29,7 +29,8 @@
     ├── CHANGELOG-v0.12.md         v0.11 → v0.12 變更說明（交接用）
     ├── CHANGELOG-v0.13.md         v0.12 → v0.13 變更說明（單一實例鎖）
     ├── CHANGELOG-v0.14.md         v0.13 → v0.14 變更說明（省資源模式）
-    └── CHANGELOG-v0.15.md         v0.14 → v0.15 變更說明（卡片頭像）
+    ├── CHANGELOG-v0.15.md         v0.14 → v0.15 變更說明（卡片頭像）
+    └── CHANGELOG-v0.16.md         v0.15 → v0.16 變更說明（剪貼板 / 編輯選單）
 ```
 
 執行期資料（不在 repo 內）：
@@ -166,7 +167,11 @@ init()
 3. 選單列／主選單 → `statusPick` / `switchTo`
 
 流程：更新 `current` → 重設卡片選取態 → 移除 `contentHost` 子視圖 → 放入該帳號的
-`WKWebView`（沒有就建）→ 若尚未載入則 `load(muse.ai)` → 更新標題與狀態列 → 排程指紋取樣。
+`WKWebView`（沒有就建）→ **`window.makeFirstResponder(w)`** → 若尚未載入則 `load(muse.ai)`
+→ 更新標題與狀態列 → 排程指紋取樣。
+
+> `makeFirstResponder` 不能省：`removeFromSuperview` 會讓第一響應者退回視窗自己，
+> 少了這行 `⌘V`／打字／選字全部失效（見 §4.11）。
 
 > 熱鍵與 `slot` 綁定，不是陣列索引，所以刪帳號、換分組都不會改變 ⇧⌘n 的意義。
 
@@ -520,6 +525,83 @@ didFinish / select(i)
 **沒做的**：頭像不隨深／淺色主題調整（影片本來就是深底）；形象相同的兩個帳號
 只能靠名稱與編號區分，圖上分不出來。
 
+### 4.11 剪貼板與第一響應者（v0.16）
+
+**症狀**：在 1 號的對話框選字複製，切到 2 號，`⌘V` 貼不進去。
+
+**這不是剪貼板的問題，是 App 少了兩樣東西。**
+
+#### (1) 標準編輯快捷鍵靠選單分發，不是靠鍵盤事件
+
+`⌘C` / `⌘V` / `⌘X` / `⌘A` / `⌘Z` 在 AppKit 裡的實作方式是：`NSMenu` 某個項目的
+`keyEquivalent`，被 `NSApplication` 在 `performKeyEquivalent` 階段比對到，
+再轉成 `copy:` / `paste:` 這些 action 沿回應鏈發送。
+
+所以 **mainMenu 裡沒有「編輯」這一張，這幾顆鍵就永遠不會被發出去**。
+MuseDock v0.15 只有「MuseDock / 帳號 / 檢視」三張。
+
+```swift
+// buildMenu()：放在 App 選單之後
+let editItem = NSMenuItem()
+main.addItem(editItem)
+let editMenu = NSMenu(title: "編輯")
+editMenu.addItem(withTitle: "復原",   action: Selector(("undo:")), keyEquivalent: "z")
+let redo = NSMenuItem(title: "重做", action: Selector(("redo:")), keyEquivalent: "z")
+redo.keyEquivalentModifierMask = [.command, .shift]
+editMenu.addItem(redo)
+editMenu.addItem(.separator())
+editMenu.addItem(withTitle: "剪下", action: #selector(NSText.cut(_:)),       keyEquivalent: "x")
+editMenu.addItem(withTitle: "複製", action: #selector(NSText.copy(_:)),      keyEquivalent: "c")
+editMenu.addItem(withTitle: "貼上", action: #selector(NSText.paste(_:)),     keyEquivalent: "v")
+editMenu.addItem(withTitle: "全選", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+editItem.submenu = editMenu
+```
+
+`target` 一律留 `nil`：讓回應鏈自己找 `WKContentView`（它實作了 `NSText` 那組）。
+自己指定 `target = self` 會變成「選單永遠灰掉」或「貼到自己的東西」。
+
+#### (2) 換帳號後第一響應者掉回視窗
+
+`select()` 是「子視圖全部 `removeFromSuperview`，再放新的」。舊 WebView 離開視圖樹，
+`window.firstResponder` 退回視窗自己——`paste:` 發出去了，回應鏈上卻沒人執行。
+
+```swift
+contentHost.subviews.forEach { $0.removeFromSuperview() }
+contentHost.addSubview(w)
+// …activate constraints…
+window.makeFirstResponder(w)     // ← 少了這行，貼上、打字、選字全部失效
+if w.url == nil { w.load(URLRequest(url: url)) }
+```
+
+`WKWebView` 會把焦點在內部轉給 `WKContentView`。因為 WebView 物件沒被銷毀
+（§4.9 的釋放才會真的丟掉），它記得的 DOM 焦點也一併回來，切回去直接 `⌘V` 就能貼。
+
+#### 為什麼症狀是「複製成功、貼上失敗」
+
+| 動作 | 走哪條路 | v0.15 |
+|---|---|---|
+| 選字 → 右鍵「拷貝」 | WKWebView 內建右鍵選單，不經 `NSMenu` | 成功（所以以為複製沒問題） |
+| `⌘C` | 需要「編輯」選單 | 其實也失效 |
+| 切帳號 → `⌘V` | 選單缺項，事件終止 | 失敗 |
+
+#### 自檢
+
+```bash
+MUSE_STATE_DIR=/tmp/md-keytest MUSE_KEYTEST=1 MUSE_DEMO=1 \
+  ./MuseDock.app/Contents/MacOS/MuseDock
+```
+
+```
+KEYTEST idx=0 slot=1 t=0  pasteMenu=OK inWebView=true responder=WKWebView
+KEYTEST idx=1 slot=2 t=0  pasteMenu=OK inWebView=true responder=WKWebView
+PASTETEST token=MUSE-PASTE-9895 dispatched=true got=MUSE-PASTE-9895 result=PASS
+```
+
+`KEYTEST` 印兩件事：選單裡有沒有 `⌘V`、第一響應者在不在 WebView 裡。
+`PASTETEST` 是真的貼：注入 `contenteditable` → 寫 `NSPasteboard` →
+`NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)` → 讀回 `innerText` 比對。
+（`KEYTEST` 會自動在 3 秒後切到另一個帳號，所以一條日誌就能看到「切換前後」的對照。）
+
 ---
 
 ## 5. UI 規格
@@ -577,6 +659,11 @@ didFinish / select(i)
 13. **樣本不足時不要覆寫既有指紋**：切換帳號的瞬間舊頁面被移出畫面，`innerText` 讀不到東西，
     `fingerprintJS` 會回 `n=0`。照寫就會把原本 20 幾筆樣本清成空陣列，重複偵測從此失效（v0.15 修）。
     規則：`n < 2` 只重試、不寫入；兩次都失敗就保留舊值並印 `FP_KEEP`。
+14. **「複製得到、貼不上」先看 mainMenu**：`⌘C`/`⌘V`/`⌘X`/`⌘A`/`⌘Z` 是靠「編輯」選單項的
+    `keyEquivalent` 分發到第一響應者的，程式化建選單時很容易只加 App／帳號／檢視就忘了它。
+    少了那張選單，`paste:` 永遠不會被發出去；再加上 `removeFromSuperview` 會讓
+    `window.firstResponder` 退回視窗自己，兩層一起壞就是「看得到、貼不進去」（v0.16 修，見 §4.11）。
+    右鍵選單是 WebKit 自己管的，會讓人誤判「複製正常」。
 
 ---
 
@@ -608,6 +695,7 @@ didFinish / select(i)
 | `MUSE_STORE_SELFTEST=1` | 連續 200 次原子寫入 `accounts.json`（內容不變），並故意注入一次外部改動以驗證 `STORE_CONFLICT`；搭配外部輪詢腳本可確認讀不到半截檔 |
 | `MUSE_AUTOSTART=status\|on\|off` | 查詢／設定開機自動啟動（`SMAppService`），印出 status 後退出 |
 | `MUSE_START_SLOT=<slot>` | 啟動時直接選定該帳號 |
+| `MUSE_KEYTEST=1` | 自檢：切換帳號（3 秒後自動切另一個）時印 `KEYTEST`（⌘V 選單項在不在、第一響應者在不在 WebView），並在 9 秒時做一次真的貼上（`PASTETEST … result=PASS`）。見 §4.11 |
 | `MUSE_AUTOLOGIN=1` | 探測時自動點「一鍵登入」卡片 |
 | `MUSE_SHOW=1` | 讓視窗真正顯示（headless 探測必加） |
 | `MUSE_PROBE_WAIT=<秒>` | 探測前等待時間（預設 8，建議 16） |
@@ -636,6 +724,7 @@ MUSE_SHOW=1 MUSE_CHROME_APPLY="Profile 15" MUSE_PROBE_WAIT=16 \
 | 簽章 | ad-hoc，無公證 | 換機器首次開啟需右鍵「打開」 |
 | 測試 | 無單元測試，只有 CLI 自測入口 | 改動靠人工驗證 |
 | 多實例 | v0.13 起用 `flock`（`instance.lock`）擋住；寫入型 CLI 直接拒絕 | 已解決。仍需注意：同一份 `accounts.json` 不要用兩個不同路徑的 App 同時開 |
+| 剪貼板 | v0.16 補上「編輯」選單並在切換時交還第一響應者 | 已解決 `⌘C`/`⌘V`；但被省資源釋放後重建的帳號，DOM 焦點會丟，切回去要重新點一下輸入框 |
 
 ---
 
@@ -662,6 +751,7 @@ MUSE_SHOW=1 MUSE_CHROME_APPLY="Profile 15" MUSE_PROBE_WAIT=16 \
 | 0.13 | 單一實例鎖（`flock` on `instance.lock`）：第二個實例叫回既有視窗後退出；寫入型 CLI 直接拒絕，避免兩個行程覆寫 `accounts.json`；`Store.save` 改原子寫入＋跨行程檔案鎖＋`STORE_CONFLICT` 偵測 |
 | 0.14 | 省資源模式：切走的帳號閒置 10 分鐘後釋放 `WKWebView`（保留 storeID 與磁碟 cookie），切回自動重建仍登入 |
 | 0.15 | 卡片頭像：抽 AI 夥伴 `<video>` 的一幀（亮度掃包圍盒自適應裁切）存成 128×128 PNG，取代首字母；順手修掉「空指紋樣本覆寫既有樣本」的 bug；新增 `MUSE_WINDOW_FIT` 截圖輔助 |
+| 0.16 | 修「1 號複製、2 號貼不上」：補上「編輯」選單（⌘C/⌘V 靠 `keyEquivalent` 分發，缺了這張就永遠收不到），`select()` 改在換頁後 `makeFirstResponder(w)` 交還第一響應者；帳號選單修飾鍵改 `⇧⌘n`；新增 `MUSE_KEYTEST` 自檢（含真貼上驗證 `PASTETEST`） |
 
 ---
 

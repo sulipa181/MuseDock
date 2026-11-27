@@ -902,6 +902,13 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
             let start = Int(ProcessInfo.processInfo.environment["MUSE_START_SLOT"] ?? "")
                 .flatMap { slot in accounts.firstIndex(where: { $0.slot == slot }) } ?? 0
             select(start)
+            if KEYTEST, let other = accounts.indices.first(where: { $0 != start }) {
+                // 自檢：3 秒後自動切到另一個帳號，看第一響應者有沒有跟著換過去
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                    self?.select(other)
+                }
+                pasteSelfTest(delay: 9)   // 等頁面載完才有 body 可以塞測試輸入框
+            }
         }
     }
 
@@ -1255,6 +1262,11 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
             w.trailingAnchor.constraint(equalTo: contentHost.trailingAnchor),
             w.bottomAnchor.constraint(equalTo: contentHost.bottomAnchor),
         ])
+        // 換帳號時舊 WebView 被 removeFromSuperview，第一響應者會退回視窗本身，
+        // 這時 ⌘V 找不到人接（畫面看起來正常，貼上就是沒反應）。
+        // 明確把焦點交還給新的 WebView；WKWebView 會在內部轉給 WKContentView，
+        // 它記得的 DOM 焦點（例如上次停在輸入框）也一併回來。
+        window.makeFirstResponder(w)
         if w.url == nil { w.load(URLRequest(url: url)) }
         lastActiveAt[accounts[index].storeID] = Date()   // 這個帳號現在是「在用」，不准被釋放
         scheduleFingerprint(for: index)
@@ -1262,6 +1274,84 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         scheduleAvatarCapture(for: index)
         window.title = "MuseDock — \(accounts[index].name)"
         statusLabel.stringValue = "⇧⌘\(index + 1) 切換 · \(accounts[index].name)"
+        if KEYTEST {
+            reportKeyRoute("idx=\(index) slot=\(accounts[index].slot) t=0")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                self?.reportKeyRoute("idx=\(index) t=+0.6s")
+            }
+        }
+    }
+
+    /// 自檢：⌘V 這條路徑上有沒有人接。要兩件事同時成立才會貼得上——
+    /// ① 選單裡有一個 keyEquivalent 是 ⌘V 的項目（沒有就永遠收不到這顆鍵）
+    /// ② 第一響應者是（或落在）WebView 裡（不是就沒人執行 paste:）
+    func reportKeyRoute(_ tag: String) {
+        var pasteFound = false
+        for top in NSApp.mainMenu?.items ?? [] {
+            guard let sub = top.submenu else { continue }
+            for mi in sub.items where mi.keyEquivalent == "v"
+                && mi.keyEquivalentModifierMask == [.command] { pasteFound = true }
+        }
+        let fr = window.firstResponder
+        var inWeb = false
+        var cur: NSView? = fr as? NSView
+        var path: [String] = []
+        while let v = cur {
+            path.append(String(describing: type(of: v)))
+            if v is WKWebView { inWeb = true; break }
+            cur = v.superview
+        }
+        let chain = path.isEmpty ? "nil" : path.joined(separator: " < ")
+        print("KEYTEST \(tag) pasteMenu=\(pasteFound ? "OK" : "MISSING") inWebView=\(inWeb) responder=\(chain)")
+    }
+
+    /// 自檢：真的走一次貼上。造一個 contenteditable、把一段字塞進系統剪貼板，
+    /// 再用 sendAction 從第一響應者沿回應鏈找 paste:——這正是選單分發 ⌘V 的路徑。
+    /// 能貼進去才算真的修好了，光看 firstResponder 不算。
+    func pasteSelfTest(delay: Double) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            guard accounts.indices.contains(current),
+                  let w = webViews[accounts[current].storeID] else {
+                print("PASTETEST no webview"); return
+            }
+            let token = "MUSE-PASTE-\(Int.random(in: 1000...9999))"
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(token, forType: .string)
+            let mk = """
+            (function(){
+              if (!document.body) return 'nobody';
+              var d = document.getElementById('__md_probe');
+              if (!d) {
+                d = document.createElement('div');
+                d.id = '__md_probe';
+                d.setAttribute('contenteditable', 'true');
+                d.style.cssText = 'position:fixed;left:6px;top:6px;width:260px;height:30px;'
+                  + 'z-index:2147483647;outline:none;background:transparent;color:transparent;';
+                document.body.appendChild(d);
+              }
+              d.focus();
+              var r = document.createRange();
+              r.selectNodeContents(d); r.collapse(false);
+              var s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+              return document.activeElement === d ? 'focused' : 'nofocus';
+            })()
+            """
+            w.evaluateJavaScript(mk) { focusState, err in
+                guard let focusState = focusState as? String, focusState == "focused" else {
+                    print("PASTETEST token=\(token) focus=\(focusState ?? "nil") err=\(err?.localizedDescription ?? "-") result=FAIL")
+                    return
+                }
+                // 這一行就是「編輯 → 貼上」被按下時系統做的事
+                let dispatched = NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    w.evaluateJavaScript("(document.getElementById('__md_probe')||{}).innerText||''") { v, _ in
+                        let got = (v as? String) ?? ""
+                        print("PASTETEST token=\(token) dispatched=\(dispatched) got=\(got.prefix(40)) result=\(got == token ? "PASS" : "FAIL")")
+                    }
+                }
+            }
+        }
     }
 
     func selectHotKey(_ n: Int) {
@@ -1453,6 +1543,24 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         appMenu.addItem(withTitle: "結束 MuseDock", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
 
+        // 「編輯」選單：⌘C／⌘V／⌘X／⌘A／⌘Z 這些標準快捷鍵不是鍵盤事件直接送上門的，
+        // 它們靠選單項的 keyEquivalent 由 NSMenu.performKeyEquivalent 發給第一響應者。
+        // 少了這一層，WebView 裡選字複製看起來正常，貼上卻完全沒反應。
+        // target 一律留 nil：讓回應鏈自己找 WKWebView 內部的 WKContentView。
+        let editItem = NSMenuItem()
+        main.addItem(editItem)
+        let editMenu = NSMenu(title: "編輯")
+        editMenu.addItem(withTitle: "復原", action: Selector(("undo:")), keyEquivalent: "z")
+        let redoItem = NSMenuItem(title: "重做", action: Selector(("redo:")), keyEquivalent: "z")
+        redoItem.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(redoItem)
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "剪下", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "複製", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "貼上", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "全選", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = editMenu
+
         let acctItem = NSMenuItem()
         main.addItem(acctItem)
         let acctMenu = NSMenu(title: "帳號")
@@ -1463,6 +1571,8 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
             if let d = dups[idx] { title += "⚠︎ 同 \(accounts[d].slot) 號" }
             let it = NSMenuItem(title: title, action: #selector(switchTo(_:)),
                                 keyEquivalent: "\(acc.slot)")
+            // 跟全域熱鍵一致（⇧⌘n），否則選單裡會顯示成 ⌘n，多開一條沒人記得的捷徑
+            it.keyEquivalentModifierMask = [.command, .shift]
             it.tag = idx
             it.target = self
             acctMenu.addItem(it)
@@ -2554,6 +2664,8 @@ let CHROME_APPLY = ProcessInfo.processInfo.environment["MUSE_CHROME_APPLY"]
 let PROBE_MODE = IMPORT_FILE != nil || CHROME_APPLY != nil
 let WHO_SLOT = Int(ProcessInfo.processInfo.environment["MUSE_WHO"] ?? "")
 let AVATAR_SLOT = Int(ProcessInfo.processInfo.environment["MUSE_AVATAR_PROBE"] ?? "")
+/// 自檢：切換帳號後印出「⌘V 有沒有選單項接、第一響應者在不在 WebView 裡」
+let KEYTEST = ProcessInfo.processInfo.environment["MUSE_KEYTEST"] == "1"
 var importFired = false
 var avatarFired = false
 
