@@ -1,4 +1,4 @@
-# MuseDock 開發說明（v0.14）
+# MuseDock 開發說明（v0.15）
 
 一個 macOS 原生的小工具，把多個 Muse（muse.ai）帳號集中在同一個視窗裡切換，
 每個帳號各自擁有**完全隔離的 Cookie / 網站資料**，互不干擾。
@@ -7,7 +7,7 @@
 - 語言／工具鏈：Swift 6（`swiftc` 直編）、AppKit、WebKit、Carbon（全域熱鍵）、SQLite3（讀 Chrome cookie）
 - 產物：`MuseDock.app`（ad-hoc 簽章，本機執行）
 - 平台：macOS 14+ / arm64
-- 目前版本：`CFBundleShortVersionString 0.14`
+- 目前版本：`CFBundleShortVersionString 0.15`
 
 **目錄**：[1 專案結構](#1-專案結構)｜[2 架構總覽](#2-架構總覽)｜[3 資料模型](#3-資料模型)｜[4 核心流程](#4-核心流程)｜[5 UI 規格](#5-ui-規格)｜[6 選單列常駐](#6-選單列常駐)｜[7 踩過的坑](#7-踩過的坑改動前務必看)｜[8 診斷入口](#8-診斷與自測入口)｜[9 已知限制](#9-已知限制--技術債)｜[10 下一步](#10-建議下一步)｜[11 版本沿革](#11-版本沿革)｜[12 檢查清單](#12-接手檢查清單)
 
@@ -17,25 +17,26 @@
 
 ```
 ~/MuseDock/
-├── main.swift            2471 行   全部 UI + Controller + 診斷入口
+├── main.swift            2726 行   全部 UI + Controller + 診斷入口
 ├── ChromeCookies.swift    313 行   Chrome Profile 掃描與 cookie 解密
 ├── build.sh                53 行   編譯、打包 Info.plist、簽章、同步到 /Applications
 ├── AppIcon.icns / .png            程式化繪製的圖示（10 個尺寸）
 ├── tools/
-│   ├── draw_icon.py       181 行   PIL 4096px 超取樣繪製圖示
-│   └── make_sheet.py       48 行   多張截圖拼版（僅開發用）
+│   └── draw_icon.py       181 行   PIL 4096px 超取樣繪製圖示
 ├── docs/screenshot-demo.png       示範截圖（用 MUSE_STATE_DIR 跑假資料產生）
 └── docs/
     ├── DEVELOPER.md               本文件
     ├── CHANGELOG-v0.12.md         v0.11 → v0.12 變更說明（交接用）
     ├── CHANGELOG-v0.13.md         v0.12 → v0.13 變更說明（單一實例鎖）
-    └── CHANGELOG-v0.14.md         v0.13 → v0.14 變更說明（省資源模式）
+    ├── CHANGELOG-v0.14.md         v0.13 → v0.14 變更說明（省資源模式）
+    └── CHANGELOG-v0.15.md         v0.14 → v0.15 變更說明（卡片頭像）
 ```
 
 執行期資料（不在 repo 內）：
 
 ```
-~/Library/Application Support/MuseDock/accounts.json    ← 唯一的狀態檔
+~/Library/Application Support/MuseDock/accounts.json            ← 唯一的狀態檔
+~/Library/Application Support/MuseDock/avatars/<storeID>.png    ← 卡片頭像快取（v0.15，非必要資料，刪掉會自己重抓）
 ~/Library/WebKit/local.sulipa.musedock/WebsiteDataStore/<storeID>/   ← WebKit 依 storeID 自動管理
 ```
 
@@ -92,6 +93,7 @@ swiftc -O -target arm64-apple-macos14.0 \
 |---|---|
 | 用 `WKWebsiteDataStore(forIdentifier:)` 而非 `WKProcessPool` 或分開 App | 這是 WebKit 官方支援的「多身分」方式，同一行程內可開多份完全隔離的儲存，不必複製 App 或切換系統使用者 |
 | 每個帳號一個 `WKWebView`，只把當前那個塞進 `contentHost`；切走的閒置 10 分鐘後釋放（v0.14） | 切換要快（保留 SPA 狀態、不必重載），但四個帳號各養一個 WebContent 太貴，所以用「閒置才回收」折中 |
+| 卡片頭像用 AI 夥伴的影片影格，而不是首字母（v0.15） | Muse 沒有使用者頭像（見 §4.10），但每個帳號的 `<video>` 形象不同且穩定，比首字母更能一眼認人 |
 | 側邊欄固定 280pt，用 Auto Layout 硬約束 | `NSSplitView.setPosition` 在視窗尚未顯示時無效，曾導致側邊欄只有 100pt |
 | 藍色按鈕 `AccentButton` 自繪 | `NSButton.bezelColor` 在部分外觀下渲染成灰色 |
 | 「已登入」以 `/api/me` 狀態碼 + 是否有輸入框判斷 | 頁面出現 "Sign in" 字樣在登入後也存在，會誤判 |
@@ -472,6 +474,52 @@ releaseWebView(storeID:)
 **沒有做的事**：手動「立即釋放」按鈕、以及依記憶體壓力自動調整門檻。
 10 分鐘是固定值，可用 `MUSE_IDLE_RELEASE_SEC` 覆寫（自測用）。
 
+### 4.10 卡片頭像（v0.15）
+
+**先講結論：Muse 前端沒有「使用者頭像」這東西。** 用 `MUSE_AVATAR_PROBE` 把整頁 dump 過一次：
+
+| 找到什麼 | 實際是什麼 |
+|---|---|
+| 9 張 `<img>`（`blob:` 來源，256×256 WebP，顯示 19–40pt） | 每個「空間（space）」的 3D 立體圖示 |
+| `background-image` | 一個都沒有 |
+| `[data-hatch-avatar-interaction]`（56×56，`aria-label="Muse"`）內含 `<video>` | **Muse(AI) 自己**的形象動畫；點開是它的檔案面板，沒有使用者名稱或 email |
+
+所以「抓使用者大頭貼」這條路不存在。但那個 `<video>` **每個帳號不一樣**：
+實測 甲＝白色絨毛小生物、乙＝黑貓抱臂、丙 與 甲 相同。同一帳號重複抽幀的 md5 一致，
+所以它可以是「這個帳號的臉」。
+
+```
+didFinish / select(i)
+ └ scheduleAvatarCapture(for:)              延遲 8 秒（等 SPA 畫完 + 影片解碼）
+      ├ 前置條件：非 DEMO、已登入、WebView 存在且可見、muse.ai、無快取（或 MUSE_AVATAR_FORCE=1）
+      ├ JS：取畫面最大的 <video>
+      │     用亮度掃出角色包圍盒（每 2px 取樣，背景是純黑）
+      │     side = 頭寬 × 1.04，水平置中、頭頂留 6% 空隙
+      │     drawImage → 128×128 PNG dataURL
+      ├ 失敗（no-video / rsN / draw:…）→ 5 秒後重試，最多三次
+      └ 成功 → AvatarStore.save(png:for: storeID) → rebuildCards()（卡片立刻換臉）
+```
+
+**為什麼要掃包圍盒，不寫死比例**：兩個形象在畫面裡的大小與位置差很多
+（頭寬約 0.62× 與 0.67× 畫面，垂直位置也不同）。第一版用固定比例（邊長 0.78、中心 0.36），
+絨毛那張的臉被推到圓心外、貓那張下顎被切掉。改成掃包圍盒後兩張都正對圓心。
+
+**為什麼必須「已登入 + 可見」**：未登入的登入頁顯示的是通用形象，不是這個帳號的；
+而隱藏的 WebView 不解碼影片，`videoWidth` 永遠是 0（§7 坑 12）。
+
+**存放與生命週期**：`~/Library/Application Support/MuseDock/avatars/<storeID>.png`
+（128×128，約 26KB）。跟著 `MUSE_STATE_DIR` 走，所以示範模式讀的是假頭像，不會污染真實快取。
+
+| 動作 | 頭像 |
+|---|---|
+| 刪除帳號 `performDelete` | `AvatarStore.remove` 一起刪 |
+| `wipe`（清除網站資料） | 一起刪——等於換身分，舊臉不該留 |
+| 閒置釋放 WebView | **保留**，切回來只重繪、不重抓 |
+| 冷啟動 | 直接讀檔，不必開頁面就有圖 |
+
+**沒做的**：頭像不隨深／淺色主題調整（影片本來就是深底）；形象相同的兩個帳號
+只能靠名稱與編號區分，圖上分不出來。
+
 ---
 
 ## 5. UI 規格
@@ -481,7 +529,7 @@ releaseWebView(storeID:)
 | 視窗 | 1240×840，最小 900×600，`fullSizeContentView` + 透明標題列；`isReleasedWhenClosed = false` |
 | 側邊欄 | 固定 280pt，右側 1px hairline 分隔線 |
 | 卡片 | 高 64pt、圓角 10、選取時 accent 13% 底 + 0.75 邊框、hover 7% 灰 |
-| 卡片內容 | 32pt 首字母圓頭像（`Palette` 6 色盤，djb2 由名稱取色）／名稱 14 semibold／`⇧n` 徽章／狀態點 5pt／副標題 11pt |
+| 卡片內容 | 32pt 圓形頭像（有快取時畫 AI 夥伴影格，否則首字母 + `Palette` 6 色盤、djb2 取色，見 §4.10）／名稱 14 semibold／`⇧n` 徽章／狀態點 5pt／副標題 11pt |
 | 副標題 | `Profile 11 · user@example.com`；無來源則只顯示 email；都沒有則 `已登入 · cookie 匯入` / `未登入` |
 | 群組標題 | 10.5 semibold、tertiary、字距 0.6 |
 | 顏色 | `Theme.dynamic(light:dark:)`，跟隨系統外觀；`Theme.accent`、`Theme.hairline` |
@@ -524,6 +572,11 @@ releaseWebView(storeID:)
 11. **單一實例鎖的 fd 要活到行程結束**：`InstanceLock.acquire()` 回傳的 fd 一旦 `close()` 就等於放鎖；
     別把它包進 `defer` 或區域變數作用域，也別「用完就關」。另外鎖檔本身留著沒關係（內容是 pid，僅供提示），
     **判斷是否持鎖只看 `flock` 的回傳值，不要看檔案存不存在**。
+12. **隱藏的 WebView 不播影片**：這是坑 1 的影片版——切走的帳號 `video.videoWidth` 永遠是 0，
+    抽幀只會拿到空白畫布。所以 `scheduleAvatarCapture` 除了要求 `host == muse.ai`，還要求 `w.window != nil`。
+13. **樣本不足時不要覆寫既有指紋**：切換帳號的瞬間舊頁面被移出畫面，`innerText` 讀不到東西，
+    `fingerprintJS` 會回 `n=0`。照寫就會把原本 20 幾筆樣本清成空陣列，重複偵測從此失效（v0.15 修）。
+    規則：`n < 2` 只重試、不寫入；兩次都失敗就保留舊值並印 `FP_KEEP`。
 
 ---
 
@@ -547,6 +600,9 @@ releaseWebView(storeID:)
 | `MUSE_DEMO=1` | 示範模式：跳過登入探測與指紋取樣，讓假資料的圓點維持原樣（配合 `MUSE_STATE_DIR` 使用） |
 | `MUSE_AVATAR_PROBE=<slot>` | 診斷：載入該帳號後 dump 所有 `img`（含祖先鏈、尺寸、`data-*`）、背景圖、`[class*=avatar]` 容器，並把 `<video>` 抽一幀轉 dataURL（頭像排查用） |
 | `MUSE_AVATAR_CLICK=<css>` | 搭配上者：先點擊指定元素（例如 `[data-hatch-avatar-interaction]`）再 dump，用於展開選單後取內容 |
+| `MUSE_AVATAR_TEST=<slot>` | 自測：先刪掉該帳號的頭像快取再載入，45 秒後檢查 PNG 是否產生（`AVATAR_TEST result PASS`） |
+| `MUSE_AVATAR_FORCE=1` | 忽略既有快取，強制重抓頭像（換了形象或想確認抽幀仍正常時用） |
+| `MUSE_WINDOW_FIT=1` | 把視窗縮進可見區域（避開選單列與 Dock）並印 `WINDOW_FRAME`，供截圖精確裁切 |
 | `MUSE_IDLE_RELEASE_SEC=<秒>` | 閒置釋放門檻，預設 600（10 分鐘）；設小一點方便測 |
 | `MUSE_IDLE_TEST=1` | 自測：開 1 號 → 切 2 號 → 等釋放 → 切回 1 號驗證仍登入，印 `result1` / `result2` |
 | `MUSE_STORE_SELFTEST=1` | 連續 200 次原子寫入 `accounts.json`（內容不變），並故意注入一次外部改動以驗證 `STORE_CONFLICT`；搭配外部輪詢腳本可確認讀不到半截檔 |
@@ -573,6 +629,7 @@ MUSE_SHOW=1 MUSE_CHROME_APPLY="Profile 15" MUSE_PROBE_WAIT=16 \
 |---|---|---|
 | 記憶體 | 每個帳號一個 `WKWebView`，切走的閒置 10 分鐘後釋放（v0.14） | 閒置期間仍佔一份 WebContent；回到該帳號要重新載入頁面（約 2–4 秒） |
 | 指紋覆蓋率 | 只有被打開過的帳號有樣本 | 冷啟動時未必能立刻標出重複 |
+| 卡片頭像 | 只在「已登入 + 頁面可見」時抽幀（v0.15） | 新匯入的帳號要切過去一次才有圖；同形象的兩個帳號只能靠名稱與編號區分 |
 | 登入狀態 | 只探當前且可見的帳號（隱藏頁不 hydrate） | 沒切過去的帳號圓點仍是舊值，切過去 6 秒內校正 |
 | Muse 真實 email | 前端不暴露（DOM/localStorage/IndexedDB/`api/me` 都沒有） | 卡片只能顯示 Chrome 的 Google 帳號 |
 | 平台 | arm64 / macOS 14+ 硬編碼 | 換 Intel 需改 `-target` |
@@ -584,10 +641,10 @@ MUSE_SHOW=1 MUSE_CHROME_APPLY="Profile 15" MUSE_PROBE_WAIT=16 \
 
 ## 10. 建議下一步
 
-1. **頭像換成 Muse 真實大頭貼**：頁面 `img[src*="avatar"]` 抓得到（診斷腳本已在抓），存起來當快取
-2. **熱鍵可自訂**：目前固定 `⇧⌘1–9`，可能與其他 App 衝突
-3. **匯入前預檢重複**：匯入後若指紋命中，直接在對話框問「要保留哪一個」
-4. **記憶體壓力自適應**：目前門檻固定 10 分鐘，可改成依 `os_proc_available_memory()` 動態收緊
+1. **熱鍵可自訂**：目前固定 `⇧⌘1–9`，可能與其他 App 衝突
+2. **匯入前預檢重複**：匯入後若指紋命中，直接在對話框問「要保留哪一個」
+3. **記憶體壓力自適應**：目前門檻固定 10 分鐘，可改成依 `os_proc_available_memory()` 動態收緊
+4. **頭像補抓**：目前只在使用者切過去時抓；可改成背景依序把已登入帳號的頭像補齊
 
 ---
 
@@ -604,6 +661,7 @@ MUSE_SHOW=1 MUSE_CHROME_APPLY="Profile 15" MUSE_PROBE_WAIT=16 \
 | 0.12 | 登入狀態即時化（`scheduleLoginProbe`，節流 180s、只探可見的當前帳號）；開機自動啟動（`SMAppService.mainApp` + 選單勾選項） |
 | 0.13 | 單一實例鎖（`flock` on `instance.lock`）：第二個實例叫回既有視窗後退出；寫入型 CLI 直接拒絕，避免兩個行程覆寫 `accounts.json`；`Store.save` 改原子寫入＋跨行程檔案鎖＋`STORE_CONFLICT` 偵測 |
 | 0.14 | 省資源模式：切走的帳號閒置 10 分鐘後釋放 `WKWebView`（保留 storeID 與磁碟 cookie），切回自動重建仍登入 |
+| 0.15 | 卡片頭像：抽 AI 夥伴 `<video>` 的一幀（亮度掃包圍盒自適應裁切）存成 128×128 PNG，取代首字母；順手修掉「空指紋樣本覆寫既有樣本」的 bug；新增 `MUSE_WINDOW_FIT` 截圖輔助 |
 
 ---
 
@@ -634,6 +692,18 @@ MUSE_STORE_SELFTEST=1 /Applications/MuseDock.app/Contents/MacOS/MuseDock | grep 
 
 # 8. 省資源模式（先關掉 App；約 50 秒，結尾應為 result1 PASS / result2 PASS）
 MUSE_IDLE_TEST=1 MUSE_IDLE_RELEASE_SEC=10 /Applications/MuseDock.app/Contents/MacOS/MuseDock | grep IDLE_TEST
+
+# 9. 頭像抽幀（先關掉 App；約 45 秒，應印 AVATAR name=… 與 result PASS）
+MUSE_AVATAR_TEST=1 /Applications/MuseDock.app/Contents/MacOS/MuseDock | grep AVATAR_TEST
+```
+
+### 截圖（給 README）
+
+```bash
+MUSE_STATE_DIR=/tmp/musedock-demo MUSE_DEMO=1 MUSE_WINDOW_FIT=1 \
+  /Applications/MuseDock.app/Contents/MacOS/MuseDock
+# 記下輸出的 WINDOW_FRAME，換算成像素裁切（scale=2）：
+#   left = x*2, top = (screenH - y - h)*2, right = (x+w)*2, bottom = (screenH - y)*2
 ```
 
 文件與程式碼不一致時，**以程式碼為準**並回頭修這份文件；README 用的截圖必須用 `MUSE_STATE_DIR` 指向假資料重新產生（見 §8 `MUSE_DEMO`），

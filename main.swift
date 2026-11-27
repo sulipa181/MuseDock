@@ -211,6 +211,57 @@ enum Store {
     }
 }
 
+// MARK: - 頭像快取
+
+/// Muse 沒有「使用者頭像」，但每個帳號的 AI 夥伴形象（`<video>` 動畫）不同，
+/// 抽一幀存成 PNG 當卡片頭像。檔案跟著 storeID 走，換裝置／清資料就重抓。
+enum AvatarStore {
+    /// 放在 Store.dir 底下，所以 `MUSE_STATE_DIR` 一換，快取也跟著隔離
+    static var dir: URL {
+        let d = Store.dir.appendingPathComponent("avatars", isDirectory: true)
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }
+
+    static func file(for storeID: String) -> URL {
+        dir.appendingPathComponent("\(storeID).png")
+    }
+
+    static func image(for storeID: String) -> NSImage? {
+        guard !storeID.isEmpty else { return nil }
+        let f = file(for: storeID)
+        guard FileManager.default.fileExists(atPath: f.path) else { return nil }
+        return NSImage(contentsOf: f)
+    }
+
+    static func save(png: Data, for storeID: String) -> Bool {
+        guard !storeID.isEmpty, NSImage(data: png) != nil else { return false }
+        do {
+            try png.write(to: file(for: storeID), options: .atomic)
+            return true
+        } catch {
+            print("AVATAR_SAVE_ERR \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    static func remove(for storeID: String) {
+        guard !storeID.isEmpty else { return }
+        try? FileManager.default.removeItem(at: file(for: storeID))
+    }
+
+    /// `data:image/png;base64,...` → Data
+    static func decodeDataURL(_ s: String) -> Data? {
+        guard s.hasPrefix("data:image/"), let comma = s.firstIndex(of: ",") else { return nil }
+        return Data(base64Encoded: String(s[s.index(after: comma)...]))
+    }
+
+    /// 診斷用：快取目錄內有幾張圖
+    static func count() -> Int {
+        (try? FileManager.default.contentsOfDirectory(atPath: dir.path))?.filter { $0.hasSuffix(".png") }.count ?? 0
+    }
+}
+
 // MARK: - 小工具
 
 final class FlippedView: NSView {
@@ -274,11 +325,13 @@ enum Palette {
 final class AvatarView: NSView {
     private let tint: NSColor
     private let initial: String
+    private let portrait: NSImage?
 
-    init(name: String, diameter: CGFloat) {
+    init(name: String, diameter: CGFloat, image: NSImage? = nil) {
         tint = Palette.color(for: name)
         let first = name.trimmingCharacters(in: .whitespaces).first.map { String($0) } ?? "M"
         initial = first.uppercased()
+        portrait = image
         super.init(frame: NSRect(x: 0, y: 0, width: diameter, height: diameter))
         translatesAutoresizingMaskIntoConstraints = false
         widthAnchor.constraint(equalToConstant: diameter).isActive = true
@@ -290,8 +343,27 @@ final class AvatarView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         let d = min(bounds.width, bounds.height)
         let rect = NSRect(x: (bounds.width - d) / 2, y: (bounds.height - d) / 2, width: d, height: d)
+        let circle = NSBezierPath(ovalIn: rect)
+
+        if let portrait {
+            // 有抓到的形象就圓形裁切畫上去；底色墊一層，避免 PNG 半透明處透出桌面
+            NSGraphicsContext.saveGraphicsState()
+            circle.addClip()
+            tint.withAlphaComponent(0.18).setFill()
+            rect.fill()
+            portrait.draw(in: rect, from: NSRect(origin: .zero, size: portrait.size),
+                          operation: .sourceOver, fraction: 1, respectFlipped: false, hints: nil)
+            NSGraphicsContext.restoreGraphicsState()
+            // 內圈細線：深色頭像貼在淺色側欄時比較有邊界感
+            NSColor.labelColor.withAlphaComponent(0.12).setStroke()
+            let ring = NSBezierPath(ovalIn: rect.insetBy(dx: 0.5, dy: 0.5))
+            ring.lineWidth = 1
+            ring.stroke()
+            return
+        }
+
         tint.setFill()
-        NSBezierPath(ovalIn: rect).fill()
+        circle.fill()
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: d * 0.44, weight: .semibold),
             .foregroundColor: NSColor.white,
@@ -423,7 +495,8 @@ final class AccountCard: NSView {
         translatesAutoresizingMaskIntoConstraints = false
         heightAnchor.constraint(equalToConstant: 64).isActive = true
 
-        let avatar = AvatarView(name: account.name, diameter: 32)
+        let avatar = AvatarView(name: account.name, diameter: 32,
+                                image: AvatarStore.image(for: account.storeID))
         let name = NSTextField(labelWithString: account.name)
         name.font = .systemFont(ofSize: 14, weight: .semibold)
         name.textColor = .labelColor
@@ -611,6 +684,10 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
     var idleTimer: Timer?
     /// 最近一次探測結果（storeID → 是否登入），自測用
     var lastProbe: [String: Bool] = [:]
+    /// 頭像抓取中的 storeID，避免重入（抽幀要等影片解碼，比一般操作慢）
+    var avatarBusy: Set<String> = []
+    /// 各 storeID 上次「嘗試」抓頭像的時間：失敗也記，否則每次 didFinish 都會重試
+    var avatarAt: [String: Date] = [:]
     var cards: [AccountCard] = []
     var current: Int = 0
 
@@ -638,6 +715,20 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         window.setFrameAutosaveName("MuseDockMain")
         window.isReleasedWhenClosed = false   // 常駐：關窗後仍保留，可從選單列叫回
         window.appearance = nil // 跟隨系統深／淺色
+
+        // 截圖輔助：縮進「可見區域」（避開選單列與 Dock），並印出 frame 供裁圖換算。
+        // 只在設了 MUSE_WINDOW_FIT=1 時生效，平常不改變使用者調好的視窗大小。
+        if ProcessInfo.processInfo.environment["MUSE_WINDOW_FIT"] == "1", let screen = NSScreen.main {
+            let vf = screen.visibleFrame
+            var f = window.frame
+            // 固定成設計尺寸 1240×840（太小的螢幕才縮），這樣每版截圖比例一致
+            f.size = NSSize(width: min(1240, vf.width - 16), height: min(840, vf.height - 16))
+            f.origin = NSPoint(x: vf.minX + (vf.width - f.width) / 2,
+                               y: vf.minY + (vf.height - f.height) / 2)
+            window.setFrame(f, display: true)
+            print("WINDOW_FRAME x=\(Int(f.minX)) y=\(Int(f.minY)) w=\(Int(f.width)) h=\(Int(f.height))"
+                  + " screen=\(Int(screen.frame.width))x\(Int(screen.frame.height)) scale=\(Int(screen.backingScaleFactor))")
+        }
 
         super.init()
 
@@ -877,17 +968,23 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                       let idx = self.accounts.firstIndex(where: { $0.storeID == storeID }) else { return }
                 let items = (obj["items"] as? [String]) ?? []
                 print("FP name=\(self.accounts[idx].name) n=\(n) hash=\(hash) items=\(items.prefix(3))")
-                if n < 2 && attempt == 0 {
-                    // 樣本不足：可能清單還沒載完，稍後再試一次
-                    self.fpAt[storeID] = .distantPast
-                    self.scheduleFingerprint(for: idx, attempt: 1)
+                guard n >= 2 else {
+                    if attempt == 0 {
+                        // 樣本不足：可能清單還沒載完，稍後再試一次
+                        self.fpAt[storeID] = .distantPast
+                        self.scheduleFingerprint(for: idx, attempt: 1)
+                    } else if !self.accounts[idx].fpItems.isEmpty {
+                        // 兩次都拿不到（多半是 WebView 被切走、隱藏頁不 hydrate）：
+                        // 空樣本蓋掉既有指紋會讓重複偵測失效，寧可留著舊的
+                        print("FP_KEEP name=\(self.accounts[idx].name) n=\(n) keep=\(self.accounts[idx].fpItems.count)")
+                    }
                     return
                 }
-                let fp = n >= 2 ? "v1|\(n)|\(hash)" : ""
+                let fp = "v1|\(n)|\(hash)"
                 let all = (obj["all"] as? [String]) ?? items
                 guard self.accounts[idx].fingerprint != fp || self.accounts[idx].fpItems != all else { return }
                 self.accounts[idx].fingerprint = fp
-                self.accounts[idx].fpItems = n >= 2 ? all : []
+                self.accounts[idx].fpItems = all
                 Store.save(self.accounts)
                 self.rebuildCards()
                 self.reportDuplicates()
@@ -974,6 +1071,127 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         }
     }
 
+    /// 抽一幀 AI 夥伴的動畫當卡片頭像。
+    ///
+    /// Muse 前端沒有使用者照片，但每個帳號的 `<video>` 形象不同（實測 甲＝白色絨毛、
+    /// 乙＝黑貓），而且同一帳號跨次抽到的影格一致，所以拿它當「這個帳號的臉」。
+    /// 只在**已登入**時抓：未登入的登入頁顯示的是通用形象，不是這個帳號的。
+    func scheduleAvatarCapture(for index: Int, attempt: Int = 0) {
+        if DEMO { return }        // 示範模式沒有真的頁面，頭像是直接放進快取目錄的
+        guard accounts.indices.contains(index) else { return }
+        let acc = accounts[index]
+        guard acc.loggedIn else { return }
+        let storeID = acc.storeID
+        if !avatarForce, AvatarStore.image(for: storeID) != nil { return }
+        // 隱藏的 WebView 不會解碼影片（videoWidth 永遠 0），必須是顯示中的那個
+        guard let w = webViews[storeID], w.url?.host?.contains("muse.ai") == true, w.window != nil else { return }
+        guard !avatarBusy.contains(storeID) else { return }
+        if let t = avatarAt[storeID], Date().timeIntervalSince(t) < 60 { return }
+        avatarBusy.insert(storeID)
+        avatarAt[storeID] = Date()
+
+        let delay: TimeInterval = attempt == 0 ? 8 : 5
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak w] in
+            guard let self, let w, w.url?.host?.contains("muse.ai") == true else {
+                self?.avatarBusy.remove(storeID)
+                return
+            }
+            w.callAsyncJavaScript(self.avatarJS, arguments: [:], in: nil, in: .page) { r in
+                self.avatarBusy.remove(storeID)
+                guard case .success(let v) = r, let text = v as? String,
+                      let data = text.data(using: .utf8),
+                      let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                    print("AVATAR_ERR \(r)")
+                    return
+                }
+                guard (obj["ok"] as? Bool) == true,
+                      let url = obj["url"] as? String,
+                      let png = AvatarStore.decodeDataURL(url) else {
+                    let why = (obj["why"] as? String) ?? "?"
+                    if attempt < 2, let idx = self.accounts.firstIndex(where: { $0.storeID == storeID }) {
+                        print("AVATAR_RETRY store=\(storeID.prefix(8)) why=\(why) attempt=\(attempt + 1)")
+                        self.avatarAt.removeValue(forKey: storeID)   // 重試要繞過 60 秒節流
+                        self.scheduleAvatarCapture(for: idx, attempt: attempt + 1)
+                    } else {
+                        print("AVATAR_GIVEUP store=\(storeID.prefix(8)) why=\(why)")
+                    }
+                    return
+                }
+                guard AvatarStore.save(png: png, for: storeID) else { return }
+                let name = self.accounts.first(where: { $0.storeID == storeID })?.name ?? "?"
+                print("AVATAR name=\(name) bytes=\(png.count) vw=\(obj["vw"] ?? 0) vh=\(obj["vh"] ?? 0) crop=\(obj["crop"] ?? "?") at=\(AvatarStore.file(for: storeID).lastPathComponent)")
+                self.rebuildCards()
+            }
+        }
+    }
+
+    /// 抓 `<video>` 的一幀，正方形裁切到頭部後縮成 128×128。
+    ///
+    /// 不能固定比例：實測兩個形象在畫面裡的大小差很多（白絨毛頭寬約 0.62×畫面、
+    /// 黑貓約 0.67×畫面，而且垂直位置不同）。所以先用亮度掃出角色的包圍盒，
+    /// 再以「頭寬」決定正方形邊長，臉就一定會落在圓心而不是偏一邊。
+    private let avatarJS = """
+    return await (async () => {
+      const vs = [...document.querySelectorAll('video')].filter(v => v.videoWidth > 0);
+      if (!vs.length) return JSON.stringify({ ok: false, why: 'no-video' });
+      vs.sort((a, b) => b.videoWidth * b.videoHeight - a.videoWidth * a.videoHeight);
+      const v = vs[0];
+      if (v.readyState < 2) return JSON.stringify({ ok: false, why: 'rs' + v.readyState });
+      const w = v.videoWidth, h = v.videoHeight;
+
+      // 影片背景是純黑，用亮度掃出角色邊界（每 2px 取樣，720×720 約 13 萬次）
+      let minX = w, minY = h, maxX = -1, maxY = -1;
+      const probe = document.createElement('canvas');
+      probe.width = w; probe.height = h;
+      const g0 = probe.getContext('2d', { willReadFrequently: true });
+      try {
+        g0.drawImage(v, 0, 0, w, h);
+        const d = g0.getImageData(0, 0, w, h).data;
+        for (let y = 0; y < h; y += 2) {
+          for (let x = 0; x < w; x += 2) {
+            const i = (y * w + x) * 4;
+            if (d[i + 3] > 20 && (d[i] + d[i + 1] + d[i + 2]) > 60) {
+              if (x < minX) minX = x;
+              if (x > maxX) maxX = x;
+              if (y < minY) minY = y;
+              if (y > maxY) maxY = y;
+            }
+          }
+        }
+      } catch (e) {
+        minX = -1;
+      }
+
+      let side, sx, sy;
+      if (maxX > 0 && maxX - minX > w * 0.2) {
+        const bw = maxX - minX;                       // 頭（含耳朵）的寬度
+        side = Math.round(Math.min(Math.min(w, h), bw * 1.04));
+        const cx = (minX + maxX) / 2;
+        sx = Math.round(cx - side / 2);
+        sy = Math.round(minY - side * 0.06);          // 頭頂留一點空隙，別貼邊
+      } else {
+        side = Math.round(Math.min(w, h) * 0.72);     // 掃不到就退回固定比例
+        sx = Math.round(w / 2 - side / 2);
+        sy = Math.round(h * 0.5 - side / 2);
+      }
+      sx = Math.max(0, Math.min(w - side, sx));
+      sy = Math.max(0, Math.min(h - side, sy));
+
+      const c = document.createElement('canvas');
+      c.width = c.height = 128;
+      const g = c.getContext('2d');
+      try {
+        g.drawImage(v, sx, sy, side, side, 0, 0, 128, 128);
+      } catch (e) {
+        return JSON.stringify({ ok: false, why: 'draw:' + String(e) });
+      }
+      return JSON.stringify({ ok: true, url: c.toDataURL('image/png'),
+                              vw: w, vh: h, crop: [sx, sy, side] });
+    })();
+    """
+
+    var avatarForce: Bool { ProcessInfo.processInfo.environment["MUSE_AVATAR_FORCE"] == "1" }
+
     /// 比對對話列表指紋，找出「登入同一個 Muse 帳號」的重複項。
     /// 回傳 [重複者索引: 最早那個索引]，以編號小者為基準。
     func duplicateMap() -> [Int: Int] {
@@ -1041,6 +1259,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         lastActiveAt[accounts[index].storeID] = Date()   // 這個帳號現在是「在用」，不准被釋放
         scheduleFingerprint(for: index)
         scheduleLoginProbe(for: index)
+        scheduleAvatarCapture(for: index)
         window.title = "MuseDock — \(accounts[index].name)"
         statusLabel.stringValue = "⇧⌘\(index + 1) 切換 · \(accounts[index].name)"
     }
@@ -1088,6 +1307,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         // 重建的頁面是全新載入，舊的節流／忙碌標記不該延用，否則登入狀態會停在釋放前
         loginProbeAt.removeValue(forKey: storeID)
         fpAt.removeValue(forKey: storeID)
+        avatarBusy.remove(storeID)          // 抽幀的閉包會因 webView 消失而提前返回
         let name = accounts.first(where: { $0.storeID == storeID })?.name ?? "?"
         print("RELEASE name=\(name) \(reason) remain=\(webViews.count)")
     }
@@ -1123,6 +1343,31 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                 print("IDLE_TEST result2 \(back ? "PASS" : "FAIL")（重建後仍登入）")
                 exit((released && back) ? 0 : 7)
             }
+        }
+    }
+
+    /// 自測：`MUSE_AVATAR_TEST=<slot>` — 先刪掉快取，再載入該帳號，看是否抓得到頭像。
+    /// 影格在頁面載入 8 秒後抽，失敗會再試兩次（5 秒間隔），所以等 45 秒才判定。
+    func runAvatarTest(slot: Int) {
+        guard let idx = accounts.firstIndex(where: { $0.slot == slot }) else {
+            print("AVATAR_TEST no such slot \(slot)"); exit(3)
+        }
+        window.orderFrontRegardless()       // 影片要真的解碼才抽得到幀
+        let storeID = accounts[idx].storeID
+        AvatarStore.remove(for: storeID)
+        avatarAt.removeValue(forKey: storeID)
+        select(idx)
+        print("AVATAR_TEST start slot=\(slot) name=\(accounts[idx].name) loggedIn=\(accounts[idx].loggedIn)")
+        print("AVATAR_TEST dir=\(AvatarStore.dir.path)")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 45) {
+            let f = AvatarStore.file(for: storeID)
+            let exists = FileManager.default.fileExists(atPath: f.path)
+            let bytes = (try? Data(contentsOf: f))?.count ?? 0
+            print("AVATAR_TEST file=\(f.lastPathComponent) exists=\(exists) bytes=\(bytes) cacheCount=\(AvatarStore.count()) visible=\(self.window.isVisible)")
+            let ok = exists && bytes > 1000 && AvatarStore.image(for: storeID) != nil
+            print("AVATAR_TEST result \(ok ? "PASS" : "FAIL")")
+            exit(ok ? 0 : 9)
         }
     }
 
@@ -1557,6 +1802,8 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         webViews[acc.storeID]?.stopLoading()
         webViews[acc.storeID]?.removeFromSuperview()
         webViews[acc.storeID] = nil
+        AvatarStore.remove(for: acc.storeID)      // 頭像快取跟著帳號一起走
+        avatarBusy.remove(acc.storeID)
 
         // 先讓 WebKit 清 cookie/localStorage，再把它沒清掉的快取目錄整個刪掉
         let beforeSize = Store.websiteDataSize(for: acc.storeID)
@@ -1631,6 +1878,10 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                 self.webViews[storeID]?.stopLoading()
                 self.webViews[storeID]?.removeFromSuperview()
                 self.webViews[storeID] = nil
+                // 清掉網站資料等於換一個身分，舊頭像不該留著
+                AvatarStore.remove(for: storeID)
+                self.avatarBusy.remove(storeID)
+                self.avatarAt.removeValue(forKey: storeID)
                 if self.accounts.indices.contains(index) { self.accounts[index].loggedIn = false }
                 Store.save(self.accounts)
                 self.rebuildCards()
@@ -1904,6 +2155,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
            let idx = accounts.firstIndex(where: { webViews[$0.storeID] === webView }) {
             scheduleFingerprint(for: idx)
             scheduleLoginProbe(for: idx)
+            scheduleAvatarCapture(for: idx)
         }
         if AVATAR_SLOT != nil && !avatarFired && webView.url?.host?.contains("muse.ai") == true {
             avatarFired = true
@@ -2328,7 +2580,7 @@ let READONLY_CLI = ["MUSE_CHROME_LIST", "MUSE_CHROME_IMPORT", "MUSE_STATUS_TEST"
                     "MUSE_AVATAR_PROBE"]
     .contains { ENV[$0] != nil }
 let WRITING_CLI = ["MUSE_DROP_SLOT", "MUSE_WIPE_SLOT", "MUSE_IMPORT_FILE", "MUSE_CHROME_APPLY",
-                   "MUSE_STORE_SELFTEST", "MUSE_IDLE_TEST"]
+                   "MUSE_STORE_SELFTEST", "MUSE_IDLE_TEST", "MUSE_AVATAR_TEST"]
     .contains { ENV[$0] != nil }
 
 var instanceLockFD: Int32 = -1
@@ -2443,6 +2695,9 @@ if let cmd = ProcessInfo.processInfo.environment["MUSE_AUTOSTART"] {
     app.run()
 } else if let slot = WHO_SLOT {
     controller.probeWho(slot: slot)
+    app.run()
+} else if let s = ProcessInfo.processInfo.environment["MUSE_AVATAR_TEST"], let slot = Int(s) {
+    controller.runAvatarTest(slot: slot)
     app.run()
 } else if let slot = AVATAR_SLOT {
     controller.probeAvatar(slot: slot)

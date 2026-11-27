@@ -14,6 +14,7 @@
 | 快速切換 | 側邊欄卡片、全域熱鍵 `⇧⌘1–9`、選單列三種入口 |
 | Chrome Profile 匯入 | 直接解密本機 Chrome 的 muse cookie 寫入指定帳號，不用手動匯出 |
 | 來源標註 | 卡片副標題顯示 `Profile 11 · 你的 Google 帳號`，看得出資料從哪來 |
+| 帳號頭像 | 抽該帳號 AI 夥伴的形象當卡片圖示（Muse 不提供使用者頭像），存成 128×128 快取 |
 | 重複帳號偵測 | 用左側對話列表做指紋，同一個 Muse 帳號被匯入兩次會標 ⚠︎ |
 | 登入狀態即時化 | 載入後探測 `/api/me`，cookie 過期會即時反映在圓點與狀態列 |
 | 省資源模式 | 切走的帳號閒置 10 分鐘後釋放 WebView，切回自動重建且仍登入 |
@@ -48,6 +49,7 @@ cd MuseDock
 
 ```
 ~/Library/Application Support/MuseDock/accounts.json     帳號清單（含 storeID、來源、指紋）
+~/Library/Application Support/MuseDock/avatars/          卡片頭像快取（刪掉會自動重抓）
 ~/Library/WebKit/local.sulipa.musedock/WebsiteDataStore/  每個帳號的實際資料
 ```
 
@@ -65,14 +67,15 @@ docs/screenshot-demo.png 示範截圖（假資料，非真實帳號）
 
 ## 文件
 
-- [docs/DEVELOPER.md](docs/DEVELOPER.md) — 接手前先看，含資料模型、六個核心流程、11 條踩坑紀錄
-- [docs/CHANGELOG-v0.14.md](docs/CHANGELOG-v0.14.md) — 最新變更（省資源模式）
-- 更早：[v0.13](docs/CHANGELOG-v0.13.md)（單一實例鎖）、[v0.12](docs/CHANGELOG-v0.12.md)（登入狀態即時化）
+- [docs/DEVELOPER.md](docs/DEVELOPER.md) — 接手前先看，含資料模型、七個核心流程、13 條踩坑紀錄
+- [docs/CHANGELOG-v0.15.md](docs/CHANGELOG-v0.15.md) — 最新變更（卡片頭像）
+- 更早：[v0.14](docs/CHANGELOG-v0.14.md)（省資源模式）、[v0.13](docs/CHANGELOG-v0.13.md)（單一實例鎖）、[v0.12](docs/CHANGELOG-v0.12.md)（登入狀態即時化）
 
 ## 已知限制
 
 - Muse 前端不暴露登入帳號的 email，卡片上的 email 是**匯入來源的 Chrome Google 帳號**
 - 重複偵測與頭像只能針對「被開啟過」的帳號，冷啟動當下未必有樣本
+- Muse 沒有使用者頭像，卡片上顯示的是該帳號 AI 夥伴的形象；形象相同的帳號只能靠名稱與編號區分
 - `arm64 / macOS 14` 是硬編碼的編譯目標，換 Intel 需改 `-target`
 
 ## 聲明
