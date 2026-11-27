@@ -67,8 +67,9 @@ docs/screenshot-demo.png 示範截圖（假資料，非真實帳號）
 
 ## 文件
 
-- [docs/DEVELOPER.md](docs/DEVELOPER.md) — 接手前先看，含資料模型、七個核心流程、13 條踩坑紀錄
-- [docs/CHANGELOG-v0.17.md](docs/CHANGELOG-v0.17.md) — 最新變更（切換帳號後直接 `⌘V` 就能貼）
+- [docs/UPDATE-v0.17.md](docs/UPDATE-v0.17.md) — **最新更新說明**（給使用者看：改了什麼、10 秒自檢、升級方式）
+- [docs/DEVELOPER.md](docs/DEVELOPER.md) — 接手前先看，含資料模型、七個核心流程、17 條踩坑紀錄
+- [docs/CHANGELOG-v0.17.md](docs/CHANGELOG-v0.17.md) — v0.17 完整變更（切換帳號後直接 `⌘V` 就能貼）
 - 更早：[v0.16](docs/CHANGELOG-v0.16.md)（編輯選單 / ⌘V 修復）、[v0.15](docs/CHANGELOG-v0.15.md)（卡片頭像）、[v0.14](docs/CHANGELOG-v0.14.md)（省資源模式）、[v0.13](docs/CHANGELOG-v0.13.md)（單一實例鎖）、[v0.12](docs/CHANGELOG-v0.12.md)（登入狀態即時化）
 
 ## 已知限制
