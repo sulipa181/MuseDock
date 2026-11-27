@@ -84,8 +84,11 @@ WebKit 只貼給「有游標焦點」的元素
 不喜歡切過去游標就跳到輸入框的話：
 
 ```bash
-MUSE_NO_AUTOFOCUS=1 open -a MuseDock
+launchctl setenv MUSE_NO_AUTOFOCUS 1
+osascript -e 'quit app "MuseDock"'; open -a MuseDock
 ```
+
+（`open` 不會把環境變數傳給 App，所以要交給 `launchd`。想還原：`launchctl unsetenv MUSE_NO_AUTOFOCUS`。）
 
 關掉之後，**貼上本身仍然不會失效**——只是你得先點一下輸入框。這是「自動化」與「不要自作聰明」之間的分界，留給你決定。
 
