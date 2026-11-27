@@ -515,7 +515,7 @@ releaseWebView(storeID:)
 5. **Chrome 130+ 的 cookie 前綴**：解密後前 32 bytes 是 `sha256(host)`，要剝掉；`v10`/`v11` 前綴要先去掉。
 6. **一鍵登入按鈕**：只 `element.click()` 沒用，必須派發
    `pointerdown → mousedown → pointerup → mouseup → click` 完整序列；且要用「文字精確為登入、寬度最接近整卡」的按鈕，否則會點到頁首。
-7. **Chrome Profile 名稱撞名**：`Default` 叫 "Sulipa"、`Profile 2` 叫 "sulipa"。
+7. **Chrome Profile 名稱撞名**：`Default` 叫 "Work"、`Profile 2` 叫 "work"。
    `ChromeCookies.profile(matching:in:)` 規則是**先精確、再忽略大小寫**，不要改回單純 lowercase 比對。
 8. **取得金鑰的方式**：用 `/usr/bin/security find-generic-password`（已授權的系統工具），
    不要用 `SecItemCopyMatching`，後者會反覆彈鑰匙串視窗。
