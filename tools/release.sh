@@ -71,8 +71,8 @@ def patch(path, pairs, required=True):
         n = n.replace(a, b, 1)
     if n != s:
         p.write_text(n, encoding="utf-8"); print(f"  ✓ {path}")
-    elif required:
-        print(f"  ⚠️  {path} 找不到要改的字串（版本號可能已是 {new}）")
+    else:
+        print(f"  ·  {path} 已是 {new} 或找不到舊字串，未改")
 
 patch("build.sh", [(f"<key>CFBundleShortVersionString</key><string>{old}</string>",
                     f"<key>CFBundleShortVersionString</key><string>{new}</string>")])

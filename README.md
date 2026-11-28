@@ -6,7 +6,7 @@
 
 ![MuseDock](docs/screenshot-demo.png)
 
-- 目前版本：`CFBundleShortVersionString 0.17`（2026-11-27）
+- 目前版本：`CFBundleShortVersionString 0.18`（2026-11-28）
 - 需求：macOS 14 以上（arm64）、Command Line Tools
 - 簽章：ad-hoc，**未公證**——換機器第一次開啟請右鍵 →「打開」
 - 資料位置：`~/Library/Application Support/MuseDock/`（詳見 §6）
@@ -38,37 +38,26 @@
 
 ---
 
-## 2. 最近更新（v0.17）
+## 2. 最近更新（v0.18）
 
-**「在 1 號選字複製、切到 2 號 `⌘V` 貼不上」修完了。** v0.16 修的是「按鍵送不到網頁」，v0.17 修的是「送到了，但貼錯地方」。
+**介面沒變。這版是保險：帳號清單不會再被一聲不響地蓋掉，出問題也有日誌可查。**
 
 | 文件 | 給誰 | 內容 |
 |---|---|---|
-| [docs/UPDATE-v0.17.md](docs/UPDATE-v0.17.md) | **使用者** | 改了什麼、為什麼貼不上（流程圖）、10 秒自檢、升級與回滾 |
-| [docs/CHANGELOG-v0.17.md](docs/CHANGELOG-v0.17.md) | **開發** | 符號與呼叫點、兩層修法、兩個時序坑、六段自測、被否掉的方案、回歸清單 |
+| [docs/UPDATE-v0.18.md](docs/UPDATE-v0.18.md) | **使用者** | 三件事、壞檔提示長什麼樣、日誌在哪、兩個新指令 |
+| [docs/CHANGELOG-v0.18.md](docs/CHANGELOG-v0.18.md) | **開發** | 三路分流的符號表、`emit` 的設計取捨、驗證、被否掉的方案、回歸清單 |
 
-**升級**（`accounts.json` 沒有變動，**不需要重新登入**）：
-
-```bash
-pkill -x MuseDock      # ① 一定要先結束，否則新版只是躺在磁碟上
-cd ~/MuseDock && git pull && ./build.sh # ② 重建並同步到 /Applications
-open -a MuseDock                        # ③ 開新版
-```
-
-> 少了 ① 會踩一個很悶的坑：舊實例還握著 `instance.lock`，新啟動的行程搶不到鎖，
-> 只會叫回舊視窗然後 `exit(0)`——看起來像「更新沒生效」。`build.sh` 會在這種時候出聲提醒。
-
-**回滾**（一鍵，腳本會自己收掉舊實例、重建、重開）：
+**升級／回滾各一條**（`accounts.json` 格式沒變，**不需要重新登入**）：
 
 ```bash
+./tools/update.sh              # 拉最新 → 結束舊的 → 重建 → 重開
 ./tools/rollback.sh            # 回到上一個版本
-./tools/rollback.sh v0.15      # 回到指定版本
 ./tools/rollback.sh --list     # 看有哪些版本可回
 ./tools/rollback.sh main       # 回到最新
 ```
 
-它會先 `pkill` 舊實例並等鎖釋放、重建後讀 `Info.plist` 印出新舊版本，最後告訴你怎麼回 `main`。
-原始的三行等價指令見 [docs/CHANGELOG-v0.17.md](docs/CHANGELOG-v0.17.md) §6。
+兩支腳本都自己處理「先結束舊實例、等 `instance.lock` 釋放」這一步——漏掉它就會出現
+「更新沒生效」的假象（舊行程握著鎖，新行程只會叫回舊視窗然後 `exit(0)`）。
 
 不想切過去游標就跳進輸入框（`open` 不會把環境變數傳給 App，要用 `launchctl`）：
 
@@ -127,8 +116,13 @@ App 主選單有四張（與狀態列圖示的下拉選單是兩回事）：
 ~/Library/Application Support/MuseDock/accounts.json     帳號清單（含 storeID、來源、指紋）
 ~/Library/Application Support/MuseDock/avatars/          卡片頭像快取（刪掉會自動重抓）
 ~/Library/Application Support/MuseDock/instance.lock     單一實例鎖
+~/Library/Application Support/MuseDock/accounts.broken-*.json  accounts.json 讀不懂時的備份（留最近 5 份）
+~/Library/Logs/MuseDock.log                              執行日誌（4MB 輪替，留兩份）
 ~/Library/WebKit/local.sulipa.musedock/WebsiteDataStore/  每個帳號的實際資料
 ```
+
+排查問題先看日誌：`tail -50 ~/Library/Logs/MuseDock.log`。從 Dock／Finder 啟動時它也會寫，
+不必再從終端機開一份。
 
 想跑一份不影響正式資料的實例（假資料、不動真實帳號）：
 
@@ -141,14 +135,16 @@ MUSE_STATE_DIR=/tmp/md-demo MUSE_DEMO=1 ./MuseDock.app/Contents/MacOS/MuseDock
 ## 7. 專案結構
 
 ```
-main.swift               UI + Controller + 診斷入口（3119 行）
+main.swift               UI + Controller + 診斷入口（3284 行）
 ChromeCookies.swift      Chrome Profile 掃描與 cookie 解密（PBKDF2 + AES-128-CBC）
 build.sh                 編譯、打包、簽章、安裝
+tools/update.sh          一鍵升級（pull → 結束舊的 → 重建 → 重開）
 tools/rollback.sh        一鍵回滾（切版本 → 重建 → 重開）
+tools/release.sh         一鍵發版（版本號 → 建置 → commit → tag → Release）
 tools/draw_icon.py       程式化繪製 App 圖示
-docs/UPDATE-v0.17.md     使用者向更新說明
+docs/UPDATE-v0.18.md     使用者向更新說明
 docs/CHANGELOG-*.md      各版本開發向變更說明
-docs/DEVELOPER.md        開發說明（架構、流程、踩過的坑、18 條坑、自測入口）
+docs/DEVELOPER.md        開發說明（架構、流程、踩過的坑、19 條坑、自測入口）
 docs/screenshot-demo.png 示範截圖（假資料，非真實帳號）
 ```
 
@@ -158,17 +154,19 @@ docs/screenshot-demo.png 示範截圖（假資料，非真實帳號）
 
 **使用者向**
 
-- [docs/UPDATE-v0.17.md](docs/UPDATE-v0.17.md) — 最新更新說明：改了什麼、10 秒自檢、升級與回滾
+- [docs/UPDATE-v0.18.md](docs/UPDATE-v0.18.md) — 最新更新說明：這版修了什麼、日誌在哪、兩個新指令
 
 **開發向**
 
-- [docs/DEVELOPER.md](docs/DEVELOPER.md) — 接手前先看：資料模型、七個核心流程、18 條踩坑紀錄、§8 診斷與自測入口
-- [docs/CHANGELOG-v0.17.md](docs/CHANGELOG-v0.17.md) — v0.17：輸入焦點與貼上路徑（含被否掉的方案、回歸清單）
+- [docs/DEVELOPER.md](docs/DEVELOPER.md) — 接手前先看：資料模型、七個核心流程、19 條踩坑紀錄、§8 診斷與自測入口
+- [docs/CHANGELOG-v0.18.md](docs/CHANGELOG-v0.18.md) — v0.18：儲存加固與日誌（含被否掉的方案、回歸清單）
+- [docs/CHANGELOG-v0.17.md](docs/CHANGELOG-v0.17.md) — v0.17：輸入焦點與貼上路徑
 
 **沿革**
 
 | 版本 | 主題 |
 |---|---|
+| [v0.18](docs/CHANGELOG-v0.18.md) | 儲存加固（壞檔備份 + 唯讀）、日誌落盤、升級／發版腳本 |
 | [v0.17](docs/CHANGELOG-v0.17.md) | 切換帳號後直接 `⌘V` 就能貼（DOM 焦點 / 貼上路徑） |
 | [v0.16](docs/CHANGELOG-v0.16.md) | 補「編輯」選單、交還第一響應者 |
 | [v0.15](docs/CHANGELOG-v0.15.md) | 卡片頭像（抽 AI 夥伴 `<video>` 一幀） |

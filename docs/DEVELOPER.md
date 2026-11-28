@@ -1,4 +1,4 @@
-# MuseDock 開發說明（v0.17）
+# MuseDock 開發說明（v0.18）
 
 一個 macOS 原生的小工具，把多個 Muse（muse.ai）帳號集中在同一個視窗裡切換，
 每個帳號各自擁有**完全隔離的 Cookie / 網站資料**，互不干擾。
@@ -7,7 +7,7 @@
 - 語言／工具鏈：Swift 6（`swiftc` 直編）、AppKit、WebKit、Carbon（全域熱鍵）、SQLite3（讀 Chrome cookie）
 - 產物：`MuseDock.app`（ad-hoc 簽章，本機執行）
 - 平台：macOS 14+ / arm64
-- 目前版本：`CFBundleShortVersionString 0.17`
+- 目前版本：`CFBundleShortVersionString 0.18`
 
 **目錄**：[1 專案結構](#1-專案結構)｜[2 架構總覽](#2-架構總覽)｜[3 資料模型](#3-資料模型)｜[4 核心流程](#4-核心流程)｜[5 UI 規格](#5-ui-規格)｜[6 選單列常駐](#6-選單列常駐)｜[7 踩過的坑](#7-踩過的坑改動前務必看)｜[8 診斷入口](#8-診斷與自測入口)｜[9 已知限制](#9-已知限制--技術債)｜[10 下一步](#10-建議下一步)｜[11 版本沿革](#11-版本沿革)｜[12 檢查清單](#12-接手檢查清單)
 
@@ -17,12 +17,14 @@
 
 ```
 ~/MuseDock/
-├── main.swift            3119 行   全部 UI + Controller + 診斷入口
+├── main.swift            3284 行   全部 UI + Controller + 診斷入口
 ├── ChromeCookies.swift    313 行   Chrome Profile 掃描與 cookie 解密
 ├── build.sh                64 行   編譯、打包 Info.plist、簽章、同步到 /Applications、提醒執行中實例
 ├── AppIcon.icns / .png            程式化繪製的圖示（10 個尺寸）
 ├── tools/
-│   ├── rollback.sh        161 行   一鍵回滾（切 tag → pkill → 重建 → 重開）
+│   ├── rollback.sh        164 行   一鍵回滾（切 tag → pkill → 重建 → 重開）
+│   ├── update.sh          105 行   一鍵升級（pull → pkill → 重建 → 重開）
+│   ├── release.sh         163 行   一鍵發版（版本號 → build → commit → tag → Release）
 │   └── draw_icon.py       181 行   PIL 4096px 超取樣繪製圖示
 ├── docs/screenshot-demo.png       示範截圖（用 MUSE_STATE_DIR 跑假資料產生）
 └── docs/
@@ -33,7 +35,9 @@
     ├── CHANGELOG-v0.15.md         v0.14 → v0.15 變更說明（卡片頭像）
     ├── CHANGELOG-v0.16.md         v0.15 → v0.16 變更說明（編輯選單 / ⌘V 分發）
     ├── CHANGELOG-v0.17.md         v0.16 → v0.17 變更說明（輸入焦點 / 貼上路徑）
-    └── UPDATE-v0.17.md            v0.17 使用者向更新說明（不含程式細節）
+    ├── UPDATE-v0.17.md            v0.17 使用者向更新說明（不含程式細節）
+    ├── CHANGELOG-v0.18.md         v0.17 → v0.18 變更說明（儲存加固 / 日誌）
+    └── UPDATE-v0.18.md            v0.18 使用者向更新說明（不含程式細節）
 ```
 
 執行期資料（不在 repo 內）：
@@ -160,6 +164,27 @@ swiftc -O -target arm64-apple-macos14.0 \
 
 > `accounts.lock` 與 `instance.lock` 是兩個不同層級的鎖：前者只管「這幾毫秒的檔案讀寫」，
 > 後者管「整個 App 只能有一個」。前者不能取代後者——它防不了邏輯層的 lost update。
+
+### 解不出結構時：備份 + 唯讀（v0.18）
+
+`Store.load()` 有三條路，**不要合併**：
+
+| 情況 | 行為 |
+|---|---|
+| 檔案不存在 | 首次啟動 → 寫入兩張佔位帳號（`seedAndPersist`） |
+| 檔案存在、解得開 | 正常回傳，順手補 `slot <= 0` |
+| 檔案存在、解不開 | 另存 `accounts.broken-<yyyyMMdd-HHmmss>.json`（留最近 5 份）→ `Store.frozen = true` → 回傳佔位帳號**但不寫入** |
+
+`frozen` 之後 `save()` 直接 return 並每次印 `STORE_FROZEN`；GUI 啟動彈一次說明
+（`warnIfStoreFrozen`，CLI／自測不彈，免得卡住自動流程），狀態列後綴
+`⚠︎ 資料檔毀損，本次不寫入`。
+
+> **為什麼不能「解不開就回退種子並存檔」**：那等於把所有帳號連 `storeID`、指紋一起無聲刪掉，
+> 而且不報錯，只表現為「清空了」。未來給 `Account` 加必填欄位時，舊版 App 讀到新版檔案
+> 就是這條路。原子寫（v0.13）只防半截檔，防不了這個。
+>
+> 驗證：`MUSE_STORE_BROKEN_TEST=1` 檢查四件事——原檔位元組不變、備份內容一致、
+> `save` 被擋、仍能開出 UI，全過才 `exit 0`。
 
 ---
 
@@ -755,10 +780,26 @@ func forwardPaste() { NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, fro
     `pkill -x MuseDock`（`osascript -e 'quit app "MuseDock"'` 需要 TCC 自動化授權，
     未授權時回 `-10004 越權取用`，不要寫進文件當標準做法）。
     `build.sh` 偵測到執行中實例時會印警告，但**不會**替你結束它。
+19. **`print` 在 GUI 啟動時等於丟掉**：從 Dock／`open` 開的行程 stdout 接 `/dev/null`，
+    122 個 `print` 一行都不會留下。於是每次排查都得「用環境變數重跑一次自測」才看得到結論——
+    那不是診斷，是重現，而使用者看到的場景往往重現不出來。v0.18 起一律用 `emit()`
+    （stdout + `~/Library/Logs/MuseDock.log`）。**新增診斷輸出時請用 `emit`，不要用 `print`。**
 
 ---
 
 ## 8. 診斷與自測入口
+
+### 日誌（v0.18）
+
+`emit()` 取代 `print()`，同時寫 stdout 與檔案：
+
+| 啟動方式 | 日誌檔 |
+|---|---|
+| 一般 | `~/Library/Logs/MuseDock.log` |
+| 帶 `MUSE_STATE_DIR` | `<該目錄>/musedock.log`（不污染真實那份） |
+
+4MB 輪替，保留 `MuseDock.log` 與 `MuseDock.log.1`。每次啟動第一行是版本、pid、UTC 時間。
+排查順序：先 `tail -50 ~/Library/Logs/MuseDock.log`，看不到線索才跑下面的自測。
 
 全部透過環境變數驅動，直接跑 `MuseDock.app/Contents/MacOS/MuseDock` 即可（不需要 UI 操作）：
 
@@ -783,6 +824,7 @@ func forwardPaste() { NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, fro
 | `MUSE_WINDOW_FIT=1` | 把視窗縮進可見區域（避開選單列與 Dock）並印 `WINDOW_FRAME`，供截圖精確裁切 |
 | `MUSE_IDLE_RELEASE_SEC=<秒>` | 閒置釋放門檻，預設 600（10 分鐘）；設小一點方便測 |
 | `MUSE_IDLE_TEST=1` | 自測：開 1 號 → 切 2 號 → 等釋放 → 切回 1 號驗證仍登入，印 `result1` / `result2` |
+| `MUSE_STORE_BROKEN_TEST=1` | 壞檔在場時驗證「備份 + 拒絕寫入 + 原檔不動」四項，全過 `exit 0`（見 §3） |
 | `MUSE_STORE_SELFTEST=1` | 連續 200 次原子寫入 `accounts.json`（內容不變），並故意注入一次外部改動以驗證 `STORE_CONFLICT`；搭配外部輪詢腳本可確認讀不到半截檔 |
 | `MUSE_AUTOSTART=status\|on\|off` | 查詢／設定開機自動啟動（`SMAppService`），印出 status 後退出 |
 | `MUSE_START_SLOT=<slot>` | 啟動時直接選定該帳號 |
@@ -844,6 +886,7 @@ MUSE_SHOW=1 MUSE_CHROME_APPLY="Profile 15" MUSE_PROBE_WAIT=16 \
 | 0.14 | 省資源模式：切走的帳號閒置 10 分鐘後釋放 `WKWebView`（保留 storeID 與磁碟 cookie），切回自動重建仍登入 |
 | 0.15 | 卡片頭像：抽 AI 夥伴 `<video>` 的一幀（亮度掃包圍盒自適應裁切）存成 128×128 PNG，取代首字母；順手修掉「空指紋樣本覆寫既有樣本」的 bug；新增 `MUSE_WINDOW_FIT` 截圖輔助 |
 | 0.16 | 修「1 號複製、2 號貼不上」：補上「編輯」選單（⌘C/⌘V 靠 `keyEquivalent` 分發，缺了這張就永遠收不到），`select()` 改在換頁後 `makeFirstResponder(w)` 交還第一響應者；帳號選單修飾鍵改 `⇧⌘n`；新增 `MUSE_KEYTEST` 自檢（含真貼上驗證 `PASTETEST`） |
+| 0.18 | 儲存加固：`accounts.json` 解不出結構時備份為 `accounts.broken-*.json` 並轉唯讀（`Store.frozen`，`save` 拒寫、GUI 彈一次、狀態列提示），不再回退種子覆蓋；`print` 全面改為 `emit`，日誌落盤 `~/Library/Logs/MuseDock.log`（4MB 輪替兩份）；新增 `tools/update.sh` 與 `tools/release.sh`；`MUSE_STORE_BROKEN_TEST` 自測 |
 | 0.17 | 修「`⌘V` 送到了卻貼不上」：切換帳號與頁面載入後自動把 DOM 游標放回 composer（`scheduleComposerFocus`），並把「貼上」改成 `pasteIntoPage`——按下時先確認焦點再轉發原生 `paste:`，焦點掉了也貼得上；`MUSE_IDLE_TEST` 擴成六段（含失焦到 body 後的貼上驗證）；新增 `MUSE_NO_AUTOFOCUS` |
 
 ---
