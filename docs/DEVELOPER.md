@@ -17,11 +17,12 @@
 
 ```
 ~/MuseDock/
-├── main.swift            2726 行   全部 UI + Controller + 診斷入口
+├── main.swift            3119 行   全部 UI + Controller + 診斷入口
 ├── ChromeCookies.swift    313 行   Chrome Profile 掃描與 cookie 解密
 ├── build.sh                64 行   編譯、打包 Info.plist、簽章、同步到 /Applications、提醒執行中實例
 ├── AppIcon.icns / .png            程式化繪製的圖示（10 個尺寸）
 ├── tools/
+│   ├── rollback.sh        161 行   一鍵回滾（切 tag → pkill → 重建 → 重開）
 │   └── draw_icon.py       181 行   PIL 4096px 超取樣繪製圖示
 ├── docs/screenshot-demo.png       示範截圖（用 MUSE_STATE_DIR 跑假資料產生）
 └── docs/
@@ -55,6 +56,19 @@ cd ~/MuseDock && ./build.sh
 
 > 為什麼要提醒：`cp -R` 只換磁碟上的檔案，已在跑的行程仍是舊的；而單一實例鎖會讓
 > 下一次啟動 `exit(0)` 去叫回舊視窗，使用者會以為「更新沒生效」。見 §4.8 與坑 18。
+
+回滾（換版本、驗舊版行為）：
+
+```bash
+./tools/rollback.sh            # 上一個 tag
+./tools/rollback.sh v0.15      # 指定 tag
+./tools/rollback.sh main       # 回最新
+./tools/rollback.sh -n v0.16   # 只印計畫不動手
+```
+
+它把「pkill 舊實例 → 等鎖釋放 → checkout → 重建 → 印版本 → 重開」串起來，
+正是缺一環就會誤判的那些步驟（見坑 18）。**舊 tag 裡沒有這支腳本**，
+所以在 tag 上想回 main 要用它印出來的那行 `git checkout main && ./build.sh`。
 
 編譯旗標（改動前先看）：
 

@@ -250,9 +250,19 @@ pkill -x MuseDock
 cd ~/MuseDock && git pull && ./build.sh && open -a MuseDock
 
 # 回滾（accounts.json 無變動，資料不受影響）
-pkill -x MuseDock
-cd ~/MuseDock && git checkout v0.16 && ./build.sh && open -a MuseDock
-# 回到最新：git checkout main
+./tools/rollback.sh            # 上一個版本；也可以 ./tools/rollback.sh v0.15
+./tools/rollback.sh main       # 回到最新
+```
+
+`tools/rollback.sh` 就是把下面的手動流程包起來，另外多做三件事：等 `instance.lock`
+真的釋放（最多 5 秒）、重建後讀 `Info.plist` 印出新舊版本、結尾給出回 `main` 的指令
+（tag 上是 detached HEAD，且舊 tag 裡沒有這支腳本）。
+
+```bash
+# 等價的手動流程（腳本壞掉時用）
+pkill -x MuseDock; sleep 1
+git checkout v0.16 && ./build.sh && open -a MuseDock
+# 回到最新：git checkout main && ./build.sh && open -a MuseDock
 ```
 
 ---

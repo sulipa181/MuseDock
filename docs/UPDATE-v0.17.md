@@ -117,13 +117,16 @@ open -a MuseDock                        # ③ 開新的
 
 `accounts.json` 格式沒有變動，**不需要重新登入**，頭像快取也不用重抓。
 
-想退回上一版：
+想退回上一版，一行就好：
 
 ```bash
-pkill -x MuseDock
-cd ~/MuseDock && git checkout v0.16 && ./build.sh && open -a MuseDock
-# 回到最新：git checkout main
+./tools/rollback.sh          # 回到上一個版本（會自動結束舊的、重建、重開）
+./tools/rollback.sh --list   # 先看看有哪些版本可回
+./tools/rollback.sh main     # 後悔了，回到最新
 ```
+
+腳本會確認舊實例真的結束、重建完讀出版本號，所以不會出現「以為換了其實沒換」。
+`accounts.json` 沒動，回滾也不需要重新登入。
 
 ---
 

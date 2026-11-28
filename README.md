@@ -58,13 +58,17 @@ open -a MuseDock                        # ③ 開新版
 > 少了 ① 會踩一個很悶的坑：舊實例還握著 `instance.lock`，新啟動的行程搶不到鎖，
 > 只會叫回舊視窗然後 `exit(0)`——看起來像「更新沒生效」。`build.sh` 會在這種時候出聲提醒。
 
-**回滾**：
+**回滾**（一鍵，腳本會自己收掉舊實例、重建、重開）：
 
 ```bash
-pkill -x MuseDock
-cd ~/MuseDock && git checkout v0.16 && ./build.sh && open -a MuseDock
-# 回到最新：git checkout main
+./tools/rollback.sh            # 回到上一個版本
+./tools/rollback.sh v0.15      # 回到指定版本
+./tools/rollback.sh --list     # 看有哪些版本可回
+./tools/rollback.sh main       # 回到最新
 ```
+
+它會先 `pkill` 舊實例並等鎖釋放、重建後讀 `Info.plist` 印出新舊版本，最後告訴你怎麼回 `main`。
+原始的三行等價指令見 [docs/CHANGELOG-v0.17.md](docs/CHANGELOG-v0.17.md) §6。
 
 不想切過去游標就跳進輸入框（`open` 不會把環境變數傳給 App，要用 `launchctl`）：
 
@@ -140,6 +144,7 @@ MUSE_STATE_DIR=/tmp/md-demo MUSE_DEMO=1 ./MuseDock.app/Contents/MacOS/MuseDock
 main.swift               UI + Controller + 診斷入口（3119 行）
 ChromeCookies.swift      Chrome Profile 掃描與 cookie 解密（PBKDF2 + AES-128-CBC）
 build.sh                 編譯、打包、簽章、安裝
+tools/rollback.sh        一鍵回滾（切版本 → 重建 → 重開）
 tools/draw_icon.py       程式化繪製 App 圖示
 docs/UPDATE-v0.17.md     使用者向更新說明
 docs/CHANGELOG-*.md      各版本開發向變更說明
