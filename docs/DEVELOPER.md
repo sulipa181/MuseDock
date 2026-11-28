@@ -1,4 +1,4 @@
-# MuseDock 開發說明（v0.18）
+# MuseDock 開發說明（v0.19）
 
 一個 macOS 原生的小工具，把多個 Muse（muse.ai）帳號集中在同一個視窗裡切換，
 每個帳號各自擁有**完全隔離的 Cookie / 網站資料**，互不干擾。
@@ -7,7 +7,7 @@
 - 語言／工具鏈：Swift 6（`swiftc` 直編）、AppKit、WebKit、Carbon（全域熱鍵）、SQLite3（讀 Chrome cookie）
 - 產物：`MuseDock.app`（ad-hoc 簽章，本機執行）
 - 平台：macOS 14+ / arm64
-- 目前版本：`CFBundleShortVersionString 0.18`
+- 目前版本：`CFBundleShortVersionString 0.19`
 
 **目錄**：[1 專案結構](#1-專案結構)｜[2 架構總覽](#2-架構總覽)｜[3 資料模型](#3-資料模型)｜[4 核心流程](#4-核心流程)｜[5 UI 規格](#5-ui-規格)｜[6 選單列常駐](#6-選單列常駐)｜[7 踩過的坑](#7-踩過的坑改動前務必看)｜[8 診斷入口](#8-診斷與自測入口)｜[9 已知限制](#9-已知限制--技術債)｜[10 下一步](#10-建議下一步)｜[11 版本沿革](#11-版本沿革)｜[12 檢查清單](#12-接手檢查清單)
 
@@ -228,6 +228,7 @@ init()
 importChromeProfile(_:)                      main.swift
    ├ ChromeCookies.profiles()   讀 Local State 列出所有 Profile（名稱/email/上次使用/muse cookie 數）
    ├ 目標帳號：名稱完全相同 → 直接用；否則忽略大小寫；再否則彈窗問「匯入當前 / 建立新帳號 / 取消」
+   ├ 匯入前預檢：ownerOf(profileDir:) 有主人 → confirmReimport() 先問（v0.19，見下）
    ├ 背景執行緒：ChromeCookies.cookies(for: dir)   解密出 [HTTPCookie]
    └ 主執行緒：install(cookies:into:source:email:profileDir:)
           ├ 逐筆寫入該帳號的 WKWebsiteDataStore.httpCookieStore
@@ -238,6 +239,42 @@ importChromeProfile(_:)                      main.swift
 
 備援路徑：`從 cookies.txt 匯入…`（Netscape 格式，`CookieParser.parse(netscape:)`），
 給沒有 Chrome 的機器或手動匯出用。
+
+#### 匯入前預檢：同一個 Profile 只該有一個主人（v0.19）
+
+`duplicateMap()` 靠左側對話標題指紋，要等頁面真的渲染過才有樣本——也就是說，
+「同一個 Profile 匯入兩次」在匯入當下是看不出來的，等 ⚠︎ 出現時卡片已經多了一張。
+
+所以預檢改用**匯入當下就有**的資料：`profileDir`。來源目錄是唯一的，
+`ownerOf(profileDir:)` 一次線性比對，成本可忽略：
+
+| 情況 | 行為 | 按鈕 |
+|---|---|---|
+| 沒有主人 | 直接寫入（照舊） | — |
+| 主人就是目標帳號 | 問一次，說明會覆蓋登入狀態 | 「重新匯入」/「取消」 |
+| 主人是別的帳號 | 問一次，說明會多一張同帳號卡片 | 「仍要新增」/「取消」 |
+
+文案由 `reimportPrompt(profile:owner:target:)` 這個**純函式**產生，UI 只負責顯示——
+這樣 `MUSE_IMPORT_PRECHECK` 能斷言「該不該問、問什麼」，不必真的彈窗點按鈕。
+
+```bash
+# 會問什麼？只印不算，不寫任何資料
+MUSE_IMPORT_PRECHECK="Profile 11" ./MuseDock.app/Contents/MacOS/MuseDock | grep PRECHECK
+# PRECHECK dir=Profile 11 already=3 owner=Grass target=5 same=false confirm=仍要新增 title=這個 Profile 已經匯入過了
+# PRECHECK dir=Default  already=- prompt=none（這個 Profile 還沒匯入過，直接寫入）
+```
+
+`MUSE_CHROME_LIST` 的每一行也多一欄 `already=<slot>`（`-` = 還沒匯入過），
+可以在匯入前直接看一眼，不必進 GUI：
+
+```
+  Profile 11 | Grass | sulipa888@gmail.com | cookies=13 | last=11/26 19:21 | already=3
+  Profile 2  | sulipa| liangshienlin@gmail.com | cookies=12 | last=11/26 19:21 | already=-
+```
+
+> 這一欄用 `Store.peek()`（只讀，不修補 slot、不建檔）。用 `Store.load()` 會因為
+> 「補 slot」或「首次啟動寫種子」而動到檔案——診斷指令不該有副作用。
+
 
 ### 4.4 登入狀態判定（v0.12 起即時化）
 
@@ -784,6 +821,17 @@ func forwardPaste() { NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, fro
     122 個 `print` 一行都不會留下。於是每次排查都得「用環境變數重跑一次自測」才看得到結論——
     那不是診斷，是重現，而使用者看到的場景往往重現不出來。v0.18 起一律用 `emit()`
     （stdout + `~/Library/Logs/MuseDock.log`）。**新增診斷輸出時請用 `emit`，不要用 `print`。**
+20. **`activate(ignoringOtherApps:)` 在 macOS 14+ 等於沒說**：這個參數被忽略，背景啟動的行程
+    常常整個請求被丟掉，`window.isKeyWindow` 一直是 `false`。徵狀是
+    `PASTETEST … dispatched=false key=false`——看起來像「貼上壞了」，實際是「視窗從來不是 key」。
+    v0.19 起統一走 `activateApp()`（14+ 用 `NSApp.activate()`），自測也改成**明確指定第一響應者**
+    （`sendAction(to: window.firstResponder)`）。**寫新自測不要再用 `to: nil`**，那會把
+    「測試環境沒有焦點」誤讀成「功能壞了」。
+21. **`storeID` 不是 UUID 會硬崩**：`webView(for:)` 是 `UUID(uuidString: acc.storeID)!`。
+    正常流程的 storeID 都是 `UUID().uuidString`，但手改 `accounts.json`、或從別處抄帳號時
+    很容易寫成 `"S1"`，一啟動就在 `select()` 崩掉，日誌只留一行 `IDLE_TIMER`（看起來像「啟動即死」）。
+    自造測試資料請用真的 UUID：`python3 -c 'import uuid;print(uuid.uuid4())'`。
+    還沒修，記在 ROADMAP 2.4。
 
 ---
 
@@ -808,7 +856,8 @@ func forwardPaste() { NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, fro
 | `MUSE_SNAPSHOT=1` | 離屏渲染主視窗深／淺色 PNG 到 `/tmp/musedock_window_{dark,light}.png` |
 | `MUSE_STATUS_TEST=1` | 印出選單列的選單結構後結束 |
 | `MUSE_CLOSE_TEST=1` | 關窗後檢查行程是否存活，印 `AFTER_CLOSE` / `STILL_RUNNING` |
-| `MUSE_CHROME_LIST=1` | 列出掃描到的 Chrome Profile |
+| `MUSE_CHROME_LIST=1` | 列出掃描到的 Chrome Profile；每行末尾 `already=<slot>` 表示該來源目錄已被哪個帳號佔用（`-` = 沒匯入過）。只讀，不會修補或建出 `accounts.json` |
+| `MUSE_IMPORT_PRECHECK="Profile 11"` | 匯入前預檢：印出 `already=` / `owner=` / 目標 slot / 會彈什麼文案（`confirm=` / `title=`），不彈窗、不寫資料（見 §4.3） |
 | `MUSE_CHROME_IMPORT="Profile 11"` | 只解密並印出 cookie 筆數與 `hatch*` / `sess*` 的值前 12 字（不寫入） |
 | `MUSE_CHROME_APPLY="Profile 11"` | 完整走「匯入 → 載入 → 探測登入」 |
 | `MUSE_IMPORT_FILE` + `MUSE_IMPORT_ACCOUNT` | 從 Netscape cookies.txt 匯入到指定 slot |
@@ -828,7 +877,7 @@ func forwardPaste() { NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, fro
 | `MUSE_STORE_SELFTEST=1` | 連續 200 次原子寫入 `accounts.json`（內容不變），並故意注入一次外部改動以驗證 `STORE_CONFLICT`；搭配外部輪詢腳本可確認讀不到半截檔 |
 | `MUSE_AUTOSTART=status\|on\|off` | 查詢／設定開機自動啟動（`SMAppService`），印出 status 後退出 |
 | `MUSE_START_SLOT=<slot>` | 啟動時直接選定該帳號 |
-| `MUSE_KEYTEST=1` | 自檢：切換帳號（3 秒後自動切另一個）時印 `KEYTEST`（⌘V 選單項在不在、第一響應者在不在 WebView），並在 9 秒時做一次真的貼上（`PASTETEST … result=PASS`）。見 §4.11 |
+| `MUSE_KEYTEST=1` | 自檢：切換帳號（3 秒後自動切另一個）時印 `KEYTEST`（⌘V 選單項在不在、第一響應者在不在 WebView），並在 9 秒時做一次真的貼上（`PASTETEST … result=PASS`）。v0.19 起跑完自己結束（PASS → `exit 0`、FAIL → `exit 1`），可以直接接在管線後面。見 §4.11 |
 | `MUSE_NO_AUTOFOCUS=1` | 切換帳號時不要把游標放進輸入框（`⌘V` 的落點確認仍然有效）。見 §4.12 |
 | `MUSE_AUTOLOGIN=1` | 探測時自動點「一鍵登入」卡片 |
 | `MUSE_SHOW=1` | 讓視窗真正顯示（headless 探測必加） |
@@ -888,6 +937,7 @@ MUSE_SHOW=1 MUSE_CHROME_APPLY="Profile 15" MUSE_PROBE_WAIT=16 \
 | 0.16 | 修「1 號複製、2 號貼不上」：補上「編輯」選單（⌘C/⌘V 靠 `keyEquivalent` 分發，缺了這張就永遠收不到），`select()` 改在換頁後 `makeFirstResponder(w)` 交還第一響應者；帳號選單修飾鍵改 `⇧⌘n`；新增 `MUSE_KEYTEST` 自檢（含真貼上驗證 `PASTETEST`） |
 | 0.18 | 儲存加固：`accounts.json` 解不出結構時備份為 `accounts.broken-*.json` 並轉唯讀（`Store.frozen`，`save` 拒寫、GUI 彈一次、狀態列提示），不再回退種子覆蓋；`print` 全面改為 `emit`，日誌落盤 `~/Library/Logs/MuseDock.log`（4MB 輪替兩份）；新增 `tools/update.sh` 與 `tools/release.sh`；`MUSE_STORE_BROKEN_TEST` 自測 |
 | 0.17 | 修「`⌘V` 送到了卻貼不上」：切換帳號與頁面載入後自動把 DOM 游標放回 composer（`scheduleComposerFocus`），並把「貼上」改成 `pasteIntoPage`——按下時先確認焦點再轉發原生 `paste:`，焦點掉了也貼得上；`MUSE_IDLE_TEST` 擴成六段（含失焦到 body 後的貼上驗證）；新增 `MUSE_NO_AUTOFOCUS` |
+| 0.19 | 匯入前預檢重複帳號：`ownerOf(profileDir:)` + `confirmReimport()`（文案由純函式 `reimportPrompt` 產生），在寫入前就攔住「同一個 Chrome Profile 匯入兩次」；`MUSE_CHROME_LIST` 多一欄 `already=<slot>`（走新增的只讀 `Store.peek()`）；新增 `MUSE_IMPORT_PRECHECK`。順手修基線：`activateApp()` 改用 macOS 14+ 的 `NSApp.activate()`、`PASTETEST` 改指定第一響應者不再依賴 key window、`MUSE_KEYTEST` 跑完自己結束 |
 
 ---
 
@@ -921,6 +971,9 @@ MUSE_IDLE_TEST=1 MUSE_IDLE_RELEASE_SEC=10 /Applications/MuseDock.app/Contents/Ma
 
 # 9. 頭像抽幀（先關掉 App；約 45 秒，應印 AVATAR name=… 與 result PASS）
 MUSE_AVATAR_TEST=1 /Applications/MuseDock.app/Contents/MacOS/MuseDock | grep AVATAR_TEST
+
+# 10. 匯入預檢（只讀；already= 應對得上你現有的來源目錄）
+MUSE_IMPORT_PRECHECK="Profile 11" /Applications/MuseDock.app/Contents/MacOS/MuseDock | grep PRECHECK
 ```
 
 ### 截圖（給 README）

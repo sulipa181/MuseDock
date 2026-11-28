@@ -2,7 +2,7 @@
 
 這份檔案是「不用每次下指令」的依據。每次自動推進時，先讀這裡，挑一項做完，回來更新它。
 
-**目前版本：v0.18**
+**目前版本：v0.19**
 
 ---
 
@@ -20,7 +20,7 @@
 | 6 | **文件與行為一致** | README / UPDATE / CHANGELOG / DEVELOPER 的版本號、指令、行號對得上 |
 
 第 1、2 條是 v0.18 補上的（日誌落盤、壞檔唯讀），已經達成。
-第 3 條部分達成（缺匯入、頭像、多實例的回歸）。
+第 3 條部分達成（貼上、切換、釋放／重建、儲存損壞、匯入預檢有自測入口；缺頭像、多實例的回歸）。
 第 4、5、6 條還沒。
 
 ---
@@ -29,15 +29,10 @@
 
 ### P1 — 做完能明顯減少未來的麻煩
 
-#### 1.1 匯入前預檢重複帳號
+#### 1.1 匯入前預檢重複帳號 ✅ v0.19
 
-- **現狀**：`duplicateMap()` 已經存在，但只在匯入／登入完成後才標 ⚠︎，使用者可能已經建出兩張同帳號的卡片。
-- **做法**：選擇 Chrome Profile 的那一步（`scanChrome` → 匯入動作之前）先跑一次指紋比對；若該 Profile 的
-  cookie 對應到既有帳號，直接提示「這個 Profile 已經匯入成『甲』」，並提供「仍要新增」。
-- **完成定義**：同一 Profile 二次匯入時，在寫入任何資料前就出現提示；`MUSE_CHROME_LIST` 輸出多一欄
-  `already=<slot>`；文件更新 §4.x。
-- **風險**：指紋需要載入頁面才有，匯入前只有 cookie。可以先比 `profileDir`（來源目錄唯一），
-  成本幾乎為零，且能覆蓋絕大多數重複匯入。
+已做完，細節見 §4 與 `docs/CHANGELOG-v0.19.md`。留下的痕跡：
+`ownerOf(profileDir:)`、`confirmReimport()`、`MUSE_CHROME_LIST` 的 `already=<slot>`、`MUSE_IMPORT_PRECHECK`。
 
 #### 1.2 熱鍵可自訂
 
@@ -75,6 +70,16 @@
 
 選單列圖示旁顯示 `⇧2` 之類的編號，減少「我現在在哪個帳號」的判斷成本。純 UI，成本小。
 
+#### 2.4 `storeID` 不是 UUID 就硬崩
+
+- **現狀**：`webView(for:)` 是 `UUID(uuidString: acc.storeID)!`。手改 `accounts.json`、或從別處抄帳號
+  寫成 `"S1"`，啟動即在 `select()` 崩掉（SIGTRAP），日誌只留一行 `IDLE_TIMER`，看起來像「啟動即死」。
+- **做法**：解不出 UUID 時不要崩——`Store.load()` 階段就把壞的 storeID 換成新 UUID（並備份原檔），
+  或至少 `webView(for:)` 給一個臨時 store 讓畫面能開，同時 `emit("STORE_BAD_UUID …")`。
+- **完成定義**：手動把某個帳號的 `storeID` 改成 `"S1"` 後啟動不崩、日誌有一行說明、
+  `MUSE_STORE_BADID_TEST` 自測 PASS。**要動 `Store.load`，屬資料層，做之前先確認 §0 第 2 條不被破壞。**
+- **由來**：2026-11-28 手動預演每週流程時，用合成 `accounts.json` 造測試資料踩到（見 DEVELOPER 坑 21）。
+
 ### 已否掉（不要做）
 
 | 項目 | 理由 |
@@ -94,7 +99,7 @@
 3. **動手後跑同一組**，全 PASS 才算完成；任何一項 FAIL 就回退該項改動（`git checkout -- <檔案>`）。
 4. **文件同步**：`docs/DEVELOPER.md`（相關章節 + 坑，若踩到新的）、`docs/CHANGELOG-vX.md`、
    `docs/UPDATE-vX.md`、README 的版本與索引。
-5. **發版**：`./tools/release.sh <新版本> --test`。小版本遞增（0.18 → 0.19）。
+5. **發版**：`./tools/release.sh <新版本> --test`。小版本遞增（0.19 → 0.20）。
 6. **卡住就停**：需要使用者決策（例如要不要改檔案格式）或需要真實帳號操作時，寫進第 3 節並結束，
    不要自己猜。
 
@@ -114,14 +119,22 @@ rm -rf /tmp/md-fresh && mkdir -p /tmp/md-fresh
 MUSE_STATE_DIR=/tmp/md-fresh MUSE_STORE_SELFTEST=1 \
   ./MuseDock.app/Contents/MacOS/MuseDock | grep "STORE_SELFTEST done"
 
-# 3) 鍵盤路徑（16 秒；--test 發版時也會跑）
+# 3) 鍵盤路徑（約 10 秒；--test 發版時也會跑）
+#    v0.19 起跑完自己結束（PASS→0 / FAIL→1），所以管線會正常返回；
+#    自測也不再要求視窗是 key window，看到 dispatched=false key=false 才是真的壞。
 rm -rf /tmp/md-key && mkdir -p /tmp/md-key
 MUSE_STATE_DIR=/tmp/md-key MUSE_KEYTEST=1 MUSE_DEMO=1 MUSE_START_SLOT=1 \
-  ./MuseDock.app/Contents/MacOS/MuseDock | grep "PASTETEST"
+  ./MuseDock.app/Contents/MacOS/MuseDock | grep -E "PASTETEST|KEYTEST done"
 
 # 4) 日誌有沒有異常（應該什麼都不印）
 grep -E "STORE_BROKEN|STORE_FROZEN|REFUSE|FP_KEEP|STORE_CONFLICT" \
   ~/Library/Logs/MuseDock.log | tail -20
+```
+
+動到匯入相關的程式碼時，多跑這一條（只讀，不寫資料）：
+
+```bash
+MUSE_IMPORT_PRECHECK="Profile 11" ./MuseDock.app/Contents/MacOS/MuseDock | grep PRECHECK
 ```
 
 ---
@@ -138,6 +151,7 @@ grep -E "STORE_BROKEN|STORE_FROZEN|REFUSE|FP_KEEP|STORE_CONFLICT" \
 
 | 版本 | 項目 |
 |---|---|
+| 0.19 | 匯入前預檢重複帳號（`ownerOf(profileDir:)` + `confirmReimport` + `MUSE_CHROME_LIST already=<slot>` + `MUSE_IMPORT_PRECHECK`）；基線修復（`activateApp()` 走 macOS 14+ API、`PASTETEST` 不再依賴 key window、`MUSE_KEYTEST` 跑完自結束） |
 | 0.18 | 儲存加固（壞檔備份 + 唯讀 + GUI 提示）、日誌落盤、`tools/update.sh`、`tools/release.sh`、`MUSE_STORE_BROKEN_TEST` |
 | 0.17 | 輸入焦點與貼上路徑（`pasteIntoPage`、`scheduleComposerFocus`） |
 | 0.16 | 「編輯」選單、交還第一響應者 |
