@@ -227,8 +227,8 @@ init()
    ↓
 importChromeProfile(_:)                      main.swift
    ├ ChromeCookies.profiles()   讀 Local State 列出所有 Profile（名稱/email/上次使用/muse cookie 數）
-   ├ 目標帳號：名稱完全相同 → 直接用；否則忽略大小寫；再否則彈窗問「匯入當前 / 建立新帳號 / 取消」
    ├ 匯入前預檢：ownerOf(profileDir:) 有主人 → confirmReimport() 先問（v0.19，見下）
+   ├ 目標帳號：名稱完全相同 → 直接用；否則忽略大小寫；再否則彈窗問「匯入當前 / 建立新帳號 / 取消」
    ├ 背景執行緒：ChromeCookies.cookies(for: dir)   解密出 [HTTPCookie]
    └ 主執行緒：install(cookies:into:source:email:profileDir:)
           ├ 逐筆寫入該帳號的 WKWebsiteDataStore.httpCookieStore
@@ -236,6 +236,10 @@ importChromeProfile(_:)                      main.swift
           ├ Store.save() → rebuildCards() → select(idx)
           └ 重新載入 muse.ai（探測後回寫真實登入狀態）
 ```
+
+> **預檢比「目標帳號解析」還早**（坑 22）：解析目標的「建立新帳號」分支會立刻 append 一個
+> `profileDir == p.dir` 的帳號，若預檢排在它後面，`ownerOf` 會把新帳號當成「已有主人」，
+> 使用者剛選完「建立新帳號」又立刻被問一次。
 
 備援路徑：`從 cookies.txt 匯入…`（Netscape 格式，`CookieParser.parse(netscape:)`），
 給沒有 Chrome 的機器或手動匯出用。
@@ -832,6 +836,12 @@ func forwardPaste() { NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, fro
     很容易寫成 `"S1"`，一啟動就在 `select()` 崩掉，日誌只留一行 `IDLE_TIMER`（看起來像「啟動即死」）。
     自造測試資料請用真的 UUID：`python3 -c 'import uuid;print(uuid.uuid4())'`。
     還沒修，記在 ROADMAP 2.4。
+22. **預檢要放在「會製造重複」的那步之前**：`importChromeProfile` 的「建立新帳號」分支會
+    立刻 append 一個 `profileDir == p.dir` 的帳號，再 `Store.save()`。若預檢排在它後面，
+    `ownerOf` 會把這個剛建的新帳號當成「已有主人」，使用者剛選完「建立新帳號」又立刻被問
+    「這個 Profile 已經匯入過」——自己打自己。所以 v0.19 的預檢排在**目標解析之前**，
+    任何 `append` / `save` 都還沒發生。**加這類「寫入前攔截」時，先畫出所有會寫入的分支，
+    確認攔截點真的在全部寫入之前。**
 
 ---
 

@@ -15,7 +15,7 @@
 | 位置 | 新增 / 變更 | 說明 |
 |---|---|---|
 | `main.swift:149` | `Store.peek()` 新增 | 只讀 `accounts.json`：不補 slot、不寫種子、不建檔 |
-| `main.swift:2498` | `Controller.ownerOf(profileDir:)` 新增 | 回傳佔用該來源目錄的帳號索引；`nil` = 沒主人 |
+| `main.swift:2498` | `Controller.ownerOf(profileDir:)` 新增 | 回傳佔用該來源目錄的帳號索引；`nil` = 沒主人。忽略 `profileDir` 為空的帳號 |
 | `main.swift:2504` | `Controller.reimportPrompt(profile:owner:target:)` 新增 | **純函式**，回傳 `(title, body, confirm)` 三段文案 |
 | `main.swift:2521` | `Controller.confirmReimport(profile:owner:target:)` 新增 | 只負責把上面那段文案顯示成 `NSAlert` |
 | `main.swift:2565` | `importChromeProfile(_:)` 插入預檢 | 在 `ChromeCookies.cookies(for:)` **之前**，因此也在任何寫入之前 |
@@ -62,21 +62,26 @@
 
 ## 3. 修法
 
-### 3.1 預檢放在「解密之前」
+### 3.1 預檢放在「任何寫入之前」
 
 `importChromeProfile(_:)` 的順序被刻意排成：
 
 ```
-解析目標帳號（同名 → 忽略大小寫 → 彈窗問）
-   ↓
-ownerOf(profileDir:)        ← 預檢
+ownerOf(profileDir:)        ← 預檢（最前面，比 target 解析還早）
    ↓ 有主人
 confirmReimport(...)        ← 使用者按「重新匯入 / 仍要新增 / 取消」
    ↓ 同意
+解析目標帳號（同名 → 忽略大小寫 → 彈窗問「匯入當前 / 建立新帳號 / 取消」）
+   ↓
 ChromeCookies.cookies(for:) ← 這裡才開始解密
    ↓
 install(...)                ← 這裡才寫 cookie
 ```
+
+預檢之所以要比「解析目標帳號」還早，是因為「建立新帳號」那條分支會**立刻 append 一個
+`profileDir == p.dir` 的帳號**——若預檢排在它後面，`ownerOf` 會把這個剛建的新帳號當成
+「已有主人」，使用者剛選完「建立新帳號」又立刻被問「這個 Profile 已經匯入過」，
+完全錯亂（這正是初版 v0.19 埋的一個 bug，複查時抓出來並修正）。
 
 放在解密之前而不是寫入之前，是為了讓「取消」真的什麼都沒發生——
 解密會讀 Chrome 的 Keychain 條目，某些機器上會跳一次系統提示，不該為了一個被取消的操作跳。

@@ -2497,7 +2497,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
     /// 拿它做預檢幾乎零成本，能擋掉絕大多數「同一個 Profile 匯入兩次」。
     func ownerOf(profileDir dir: String) -> Int? {
         guard !dir.isEmpty else { return nil }
-        return accounts.firstIndex { $0.profileDir == dir }
+        return accounts.firstIndex { !$0.profileDir.isEmpty && $0.profileDir == dir }
     }
 
     /// 匯入前預檢的文案（純函式，UI 只負責顯示；命令列自測才能斷言「該不該問、問什麼」）
@@ -2533,6 +2533,22 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         guard chromeProfiles.indices.contains(sender.tag), !accounts.isEmpty else { return }
         let p = chromeProfiles[sender.tag]
 
+        // ── 預檢放最前面：在任何寫入（含「建立新帳號」的 append）之前 ──
+        // 若先解析 target、甚至在「建立新帳號」分支 append 完才預檢，
+        // 新帳號的 profileDir 已經寫成 p.dir，ownerOf 會把它當成「已有主人」，
+        // 使用者剛選完「建立新帳號」又立刻被問「這個 Profile 已經匯入過」。
+        if let owner = ownerOf(profileDir: p.dir) {
+            // 目標還沒定：先看是不是同名帳號（owner 之外的同名也算）
+            let sameName = accounts.firstIndex { $0.name.lowercased() == p.name.lowercased() }
+            let target = sameName ?? owner
+            emit("CHROME_PRECHECK dir=\(p.dir) already=\(accounts[owner].slot) target=\(accounts[target].slot)")
+            if !confirmReimport(profile: p, owner: owner, target: target) {
+                statusLabel.stringValue = "已取消匯入"
+                emit("CHROME_PRECHECK cancelled dir=\(p.dir)")
+                return
+            }
+        }
+
         // 同名帳號就直接匯進去，否則問一下
         var target = accounts.firstIndex { $0.name == p.name }
             ?? accounts.firstIndex { $0.name.lowercased() == p.name.lowercased() }
@@ -2559,15 +2575,6 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
             }
         }
         guard let idx = target else { return }
-
-        // 寫入任何資料之前先預檢：這個來源目錄是不是已經有主人。
-        let owner = ownerOf(profileDir: p.dir)
-        emit("CHROME_PRECHECK dir=\(p.dir) already=\(owner.map { String(accounts[$0].slot) } ?? "-") target=\(accounts[idx].slot)")
-        if let owner, !confirmReimport(profile: p, owner: owner, target: idx) {
-            statusLabel.stringValue = "已取消匯入"
-            emit("CHROME_PRECHECK cancelled dir=\(p.dir)")
-            return
-        }
 
         statusLabel.stringValue = "正在解密 \(p.dir) 的 cookie…"
         let dir = p.dir

@@ -145,7 +145,7 @@ tools/draw_icon.py       程式化繪製 App 圖示
 docs/ROADMAP.md          待辦、驗收標準、自動推進規則
 docs/UPDATE-v0.19.md     使用者向更新說明
 docs/CHANGELOG-*.md      各版本開發向變更說明
-docs/DEVELOPER.md        開發說明（架構、流程、踩過的坑、21 條坑、自測入口）
+docs/DEVELOPER.md        開發說明（架構、流程、踩過的坑、22 條坑、自測入口）
 docs/screenshot-demo.png 示範截圖（假資料，非真實帳號）
 ```
 
@@ -160,7 +160,7 @@ docs/screenshot-demo.png 示範截圖（假資料，非真實帳號）
 **開發向**
 
 - [docs/ROADMAP.md](docs/ROADMAP.md) — 下一步做什麼、怎麼驗收、自動推進的規則
-- [docs/DEVELOPER.md](docs/DEVELOPER.md) — 接手前先看：資料模型、七個核心流程、21 條踩坑紀錄、§8 診斷與自測入口
+- [docs/DEVELOPER.md](docs/DEVELOPER.md) — 接手前先看：資料模型、七個核心流程、22 條踩坑紀錄、§8 診斷與自測入口
 - [docs/CHANGELOG-v0.19.md](docs/CHANGELOG-v0.19.md) — v0.19：匯入前預檢 + 基線修復（含被否掉的方案、回歸清單）
 - [docs/CHANGELOG-v0.18.md](docs/CHANGELOG-v0.18.md) — v0.18：儲存加固與日誌
 - [docs/CHANGELOG-v0.17.md](docs/CHANGELOG-v0.17.md) — v0.17：輸入焦點與貼上路徑
