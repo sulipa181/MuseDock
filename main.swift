@@ -144,6 +144,14 @@ enum Store {
         return seedAndPersist()
     }
 
+    /// 只讀，不修補、不建檔。給命令列預檢用：`MUSE_CHROME_LIST` 只是看一眼，
+    /// 不該因為跑一次就把 slot 補起來或寫出種子帳號。
+    static func peek() -> [Account] {
+        guard let data = try? Data(contentsOf: file),
+              let list = try? JSONDecoder().decode([Account].self, from: data) else { return [] }
+        return list
+    }
+
     /// 解不出結構時把原檔另存一份，只保留最近 5 份（同一台機器反覆出錯不會塞滿目錄）。
     static func quarantine(_ data: Data) -> String? {
         let fmt = DateFormatter()
@@ -948,7 +956,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
 
 
         window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        activateApp()
         startIdleTimer()
         if accounts.isEmpty {
             showEmptyState()
@@ -1404,14 +1412,19 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                 completion(false)
                 return
             }
-            // 這一行就是「編輯 → 貼上」被按下時系統做的事
-            let dispatched = NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)
+            // 這一行就是「編輯 → 貼上」被按下時系統做的事。
+            // 收件人明確指定第一響應者，不用 to: nil：to: nil 是從「key window 的
+            // 響應鏈」起算，而 macOS 14 起背景啟動的行程拿不到自行激活權，
+            // window 不是 key 就無條件回 false——於是「測試環境沒焦點」會被誤讀成
+            // 「貼上壞了」。指定第一響應者走的是同一條鏈，只是不看誰是 key。
+            let target = self.window.firstResponder
+            let dispatched = NSApp.sendAction(#selector(NSText.paste(_:)), to: target, from: nil)
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
                 w.evaluateJavaScript("(document.getElementById('__md_probe')||{}).innerText||''") { v, _ in
                     restoreClipboard()
                     let got = (v as? String) ?? ""
                     let ok = got == token
-                    emit("PASTETEST tag=\(tag) token=\(token) dispatched=\(dispatched) key=\(NSApp.keyWindow != nil) got=\(got.prefix(40)) result=\(ok ? "PASS" : "FAIL")")
+                    emit("PASTETEST tag=\(tag) token=\(token) dispatched=\(dispatched) key=\(NSApp.keyWindow != nil) fr=\(target.map { String(describing: type(of: $0)) } ?? "nil") got=\(got.prefix(40)) result=\(ok ? "PASS" : "FAIL")")
                     completion(ok)
                 }
             }
@@ -1420,7 +1433,13 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
 
     func pasteSelfTest(delay: Double) {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            self?.pasteProbe(tag: "keytest") { _ in }
+            self?.pasteProbe(tag: "keytest") { ok in
+                // 跑完就結束。否則 ROADMAP 裡那行「… | grep PASTETEST」永遠不返回
+                // （只能靠外層 sleep + kill 兜，release.sh 就是這樣），
+                // 排進每週自動化後會把整條流程卡在一個不會退出的行程上。
+                emit("KEYTEST done result=\(ok ? "PASS" : "FAIL")")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { exit(ok ? 0 : 1) }
+            }
         }
     }
 
@@ -1703,7 +1722,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         // 自測要走真實路徑（選單 → 回應鏈），所以視窗必須是 key；
         // 只 orderFront 的話 NSApp.sendAction 找不到 WKContentView，會誤判成「貼不上」。
         window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        activateApp()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
             emit("IDLE_TEST window key=\(self.window.isKeyWindow) appActive=\(NSApp.isActive)")
         }
@@ -2023,7 +2042,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
     }
 
     @objc func showWindow() {
-        NSApp.activate(ignoringOtherApps: true)
+        activateApp()
         window.makeKeyAndOrderFront(nil)
         // 視窗重新可見時補一次探測（隱藏時 Next.js 不 hydrate，量不準）
         scheduleLoginProbe(for: current)
@@ -2461,7 +2480,8 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         guard !accounts.isEmpty else { emit("ERR_NO_ACCOUNT"); exit(4) }
         let idx = accounts.firstIndex { $0.name == p.name }
             ?? accounts.firstIndex { $0.name.lowercased() == p.name.lowercased() } ?? current
-        emit("CHROME_APPLY dir=\(dir) profile=\(p.name) target=\(accounts[idx].name)")
+        let owner = accounts.firstIndex { !$0.profileDir.isEmpty && $0.profileDir == dir }
+        emit("CHROME_APPLY dir=\(dir) profile=\(p.name) target=\(accounts[idx].name) already=\(owner.map { String(accounts[$0].slot) } ?? "-")")
         do {
             let cookies = try ChromeCookies.cookies(for: dir)
             emit("CHROME_APPLY cookies=\(cookies.count)")
@@ -2470,6 +2490,43 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
             emit("CHROME_APPLY_ERR \(error.localizedDescription)")
             exit(9)
         }
+    }
+
+    /// 同一個 Chrome Profile 來源目錄只該對應一個帳號。
+    /// 指紋（`duplicateMap`）要等頁面載完才比得出來，但 `profileDir` 匯入當下就有，
+    /// 拿它做預檢幾乎零成本，能擋掉絕大多數「同一個 Profile 匯入兩次」。
+    func ownerOf(profileDir dir: String) -> Int? {
+        guard !dir.isEmpty else { return nil }
+        return accounts.firstIndex { $0.profileDir == dir }
+    }
+
+    /// 匯入前預檢的文案（純函式，UI 只負責顯示；命令列自測才能斷言「該不該問、問什麼」）
+    func reimportPrompt(profile p: ChromeProfile, owner: Int, target: Int)
+        -> (title: String, body: String, confirm: String) {
+        if owner == target {
+            return ("「\(p.name)」已經匯入過",
+                    "來源目錄 \(p.dir) 上次匯入到「\(accounts[owner].name)」（⇧\(accounts[owner].slot)）。\n"
+                    + "繼續會用 Chrome 目前的 cookie 覆蓋這個帳號的登入狀態。",
+                    "重新匯入")
+        }
+        return ("這個 Profile 已經匯入過了",
+                "\(p.dir) 對應的是「\(accounts[owner].name)」（⇧\(accounts[owner].slot)）。\n\n"
+                + "匯入到「\(accounts[target].name)」會多出一張同一個帳號的卡片；"
+                + "重複偵測要等頁面載完才比得出來，所以在寫入前先攔一次。",
+                "仍要新增")
+    }
+
+    /// 匯入前預檢：這個來源目錄已經有主人了嗎？有就先問再寫。
+    /// 回傳 false = 使用者取消。
+    func confirmReimport(profile p: ChromeProfile, owner: Int, target: Int) -> Bool {
+        let text = reimportPrompt(profile: p, owner: owner, target: target)
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = text.title
+        alert.informativeText = text.body
+        alert.addButton(withTitle: text.confirm)
+        alert.addButton(withTitle: "取消")
+        return alert.runModal() == .alertFirstButtonReturn
     }
 
     @objc func importChromeProfile(_ sender: NSMenuItem) {
@@ -2502,6 +2559,15 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
             }
         }
         guard let idx = target else { return }
+
+        // 寫入任何資料之前先預檢：這個來源目錄是不是已經有主人。
+        let owner = ownerOf(profileDir: p.dir)
+        emit("CHROME_PRECHECK dir=\(p.dir) already=\(owner.map { String(accounts[$0].slot) } ?? "-") target=\(accounts[idx].slot)")
+        if let owner, !confirmReimport(profile: p, owner: owner, target: idx) {
+            statusLabel.stringValue = "已取消匯入"
+            emit("CHROME_PRECHECK cancelled dir=\(p.dir)")
+            return
+        }
 
         statusLabel.stringValue = "正在解密 \(p.dir) 的 cookie…"
         let dir = p.dir
@@ -3014,6 +3080,19 @@ enum InstanceLock {
 
 // MARK: - 進入點
 
+/// 把視窗叫到最前面。macOS 14 起 `activate(ignoringOtherApps:)` 的參數被忽略，
+/// 背景啟動的行程常常直接叫不動（`window.isKeyWindow` 一直是 false），
+/// 於是「熱鍵／選單叫回視窗」會看起來反應了但視窗仍在別人後面。
+/// 14+ 改走新的 `activate()`：由使用者動作（點選單、按熱鍵）觸發時才會被允許，
+/// 這正好是我們要的語意。
+func activateApp() {
+    if #available(macOS 14.0, *) {
+        NSApp.activate()
+    } else {
+        NSApp.activate(ignoringOtherApps: true)
+    }
+}
+
 let SNAPSHOT = ProcessInfo.processInfo.environment["MUSE_SNAPSHOT"] == "1"
 /// 示範／截圖模式：搭配 `MUSE_STATE_DIR` 指向假資料，不做登入探測與指紋取樣
 let DEMO = ProcessInfo.processInfo.environment["MUSE_DEMO"] == "1"
@@ -3116,7 +3195,7 @@ func emit(_ items: Any...) {
 let ENV = ProcessInfo.processInfo.environment
 let READONLY_CLI = ["MUSE_CHROME_LIST", "MUSE_CHROME_IMPORT", "MUSE_STATUS_TEST",
                     "MUSE_CLOSE_TEST", "MUSE_SNAPSHOT", "MUSE_WHO", "MUSE_AUTOSTART",
-                    "MUSE_AVATAR_PROBE"]
+                    "MUSE_AVATAR_PROBE", "MUSE_IMPORT_PRECHECK"]
     .contains { ENV[$0] != nil }
 let WRITING_CLI = ["MUSE_DROP_SLOT", "MUSE_WIPE_SLOT", "MUSE_IMPORT_FILE", "MUSE_CHROME_APPLY",
                    "MUSE_STORE_SELFTEST", "MUSE_STORE_BROKEN_TEST", "MUSE_IDLE_TEST",
@@ -3187,9 +3266,13 @@ app.setActivationPolicy(.regular)
 // 命令列自測：列出 Chrome Profile
 if ProcessInfo.processInfo.environment["MUSE_CHROME_LIST"] == "1" {
     let list = ChromeCookies.profiles()
+    // 只讀：這個模式是給「匯入前看一眼」用的，不該因為跑一次就把 accounts.json 修補或建出來
+    let existing = Store.peek()
     emit("CHROME installed=\(ChromeCookies.isInstalled) profiles=\(list.count)")
     for p in list {
-        emit("  \(p.dir) | \(p.name) | \(p.email) | cookies=\(p.cookieCount) | last=\(p.lastUsedText)")
+        // already=<slot>：這個來源目錄已經被哪個帳號佔用；"-" 代表還沒匯入過
+        let owner = existing.first { !$0.profileDir.isEmpty && $0.profileDir == p.dir }
+        emit("  \(p.dir) | \(p.name) | \(p.email) | cookies=\(p.cookieCount) | last=\(p.lastUsedText) | already=\(owner.map { String($0.slot) } ?? "-")")
     }
     exit(0)
 }
@@ -3223,6 +3306,23 @@ if ProcessInfo.processInfo.environment["MUSE_STATUS_TEST"] == "1" {
         let sub = it.submenu != nil ? " ▸(\(it.submenu?.items.count ?? 0))" : ""
         emit("  \(mark) \(it.title)\(sub)")
     }
+    exit(0)
+}
+
+// 命令列自測：匯入前的重複預檢（只算文案，不彈窗、不寫任何資料）
+// 用法：MUSE_IMPORT_PRECHECK="Profile 11" → 印出 already=<slot> 與「會問什麼」
+if let dir = ProcessInfo.processInfo.environment["MUSE_IMPORT_PRECHECK"] {
+    guard let p = ChromeCookies.profiles().first(where: { $0.dir == dir }) else {
+        emit("PRECHECK dir=\(dir) profile=missing"); exit(3)
+    }
+    guard let owner = controller.ownerOf(profileDir: dir) else {
+        emit("PRECHECK dir=\(dir) already=- prompt=none（這個 Profile 還沒匯入過，直接寫入）")
+        exit(0)
+    }
+    let target = controller.accounts.firstIndex { $0.name.lowercased() == p.name.lowercased() } ?? owner
+    let text = controller.reimportPrompt(profile: p, owner: owner, target: target)
+    emit("PRECHECK dir=\(dir) already=\(controller.accounts[owner].slot) owner=\(controller.accounts[owner].name)"
+         + " target=\(controller.accounts[target].slot) same=\(owner == target) confirm=\(text.confirm) title=\(text.title)")
     exit(0)
 }
 
