@@ -6,7 +6,7 @@
 
 ![MuseDock](docs/screenshot-demo.png)
 
-- 目前版本：`CFBundleShortVersionString 0.19`（2026-11-28）
+- 目前版本：`CFBundleShortVersionString 0.20`（2026-11-28）
 - 需求：macOS 14 以上（arm64）、Command Line Tools
 - 簽章：ad-hoc，**未公證**——換機器第一次開啟請右鍵 →「打開」
 - 資料位置：`~/Library/Application Support/MuseDock/`（詳見 §6）
