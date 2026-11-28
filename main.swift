@@ -87,6 +87,11 @@ enum Store {
     static var lockFile: URL { dir.appendingPathComponent("accounts.lock") }
     /// 上次讀到／寫入的內容指紋，用來發現「檔案被別的行程改過」
     static var lastDigest: String?
+    /// 檔案存在卻解不出 `[Account]` 時切成唯讀。一旦為 true，`save` 一律拒絕：
+    /// 少一次寫入只是這次改不動，靜默覆蓋卻是所有帳號連 storeID 一起永久消失。
+    static var frozen = false
+    /// 被隔離的檔名，給 UI／日誌引用
+    static var brokenBackup: String?
 
     static func digest(_ d: Data) -> String {
         var h: UInt64 = 0xcbf2_9ce4_8422_2325          // FNV-1a 64
@@ -123,18 +128,65 @@ enum Store {
             if changed { save(list) }
             return list
         }
+        // ── 到這裡代表「沒有檔案」或「有檔案但解不出結構」，兩者處置必須相反 ──
+        //   · 沒有檔案        → 首次啟動，寫入佔位帳號
+        //   · 有檔案但解不出  → 可能是未來版本新增的必填欄位、外部改壞、編碼問題。
+        //     此時寫入佔位帳號＝把使用者所有帳號連 storeID、指紋一起無聲刪掉。
+        //     v0.12 的原子寫只擋得住「半截檔案」，擋不住這一類。
+        if let data, !data.isEmpty {
+            frozen = true
+            brokenBackup = quarantine(data)
+            emit("STORE_BROKEN accounts.json 有 \(data.count)B 但解不出結構；已備份為 \(brokenBackup ?? "備份失敗")，本次不寫入")
+            // 給 UI 一個能開的畫面；這個結果永遠不會被存回去（save 已被 frozen 擋下）
+            return seedAccounts()
+        }
         // 首次啟動的佔位帳號：讓使用者有卡片可以直接匯入，名字之後可改
-        let seed = [
+        return seedAndPersist()
+    }
+
+    /// 解不出結構時把原檔另存一份，只保留最近 5 份（同一台機器反覆出錯不會塞滿目錄）。
+    static func quarantine(_ data: Data) -> String? {
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.dateFormat = "yyyyMMdd-HHmmss"
+        let name = "accounts.broken-\(fmt.string(from: Date())).json"
+        let url = dir.appendingPathComponent(name)
+        do {
+            try data.write(to: url, options: .atomic)
+        } catch {
+            emit("STORE_BROKEN_ERR 備份失敗 \(error.localizedDescription)")
+            return nil
+        }
+        let fm = FileManager.default
+        if let names = try? fm.contentsOfDirectory(atPath: dir.path) {
+            let olds = names.filter { $0.hasPrefix("accounts.broken-") && $0 != name }.sorted()
+            for old in olds.dropLast(4) { try? fm.removeItem(at: dir.appendingPathComponent(old)) }
+        }
+        return name
+    }
+
+    static func seedAccounts() -> [Account] {
+        [
             Account(name: "帳號 1", email: "未登入", storeID: UUID().uuidString, group: Account.mainGroup, slot: 1),
             Account(name: "帳號 2", email: "未登入", storeID: UUID().uuidString, group: Account.backupGroup, slot: 2),
         ]
+    }
+
+    static func seedAndPersist() -> [Account] {
+        let seed = seedAccounts()
         save(seed)
         return seed
     }
 
     static func save(_ list: [Account]) {
+        if frozen {
+            // 每次都印：這行若在一小時內出現幾十次，代表某段程式碼一直「以為自己在修資料」，
+            // 實際全被擋掉了——從日誌就能看出是哪裡。
+            emit("STORE_FROZEN 拒絕寫入（accounts.json 已備份為 \(brokenBackup ?? "?" )）；請處理後重啟")
+            return
+        }
         guard let data = try? JSONEncoder().encode(list) else {
-            print("STORE_SAVE_ERR encode failed count=\(list.count)")
+            emit("STORE_SAVE_ERR encode failed count=\(list.count)")
             return
         }
         withLock(LOCK_EX) {
@@ -142,7 +194,7 @@ enum Store {
             // 否則就是「帳號無聲消失」，只能靠猜。
             if lastDigest != nil, let existing = try? Data(contentsOf: file),
                digest(existing) != lastDigest {
-                print("STORE_CONFLICT 檔案已被其他行程改過（磁碟 \(existing.count)B / 本次 \(data.count)B），以本次為準")
+                emit("STORE_CONFLICT 檔案已被其他行程改過（磁碟 \(existing.count)B / 本次 \(data.count)B），以本次為準")
             }
             do {
                 // .atomic：先寫同目錄暫存檔再 rename。中途被 kill 不會留下半截 JSON，
@@ -150,7 +202,7 @@ enum Store {
                 try data.write(to: file, options: .atomic)
                 lastDigest = digest(data)
             } catch {
-                print("STORE_SAVE_ERR \(error.localizedDescription)")
+                emit("STORE_SAVE_ERR \(error.localizedDescription)")
             }
         }
     }
@@ -240,7 +292,7 @@ enum AvatarStore {
             try png.write(to: file(for: storeID), options: .atomic)
             return true
         } catch {
-            print("AVATAR_SAVE_ERR \(error.localizedDescription)")
+            emit("AVATAR_SAVE_ERR \(error.localizedDescription)")
             return false
         }
     }
@@ -728,7 +780,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
             f.origin = NSPoint(x: vf.minX + (vf.width - f.width) / 2,
                                y: vf.minY + (vf.height - f.height) / 2)
             window.setFrame(f, display: true)
-            print("WINDOW_FRAME x=\(Int(f.minX)) y=\(Int(f.minY)) w=\(Int(f.width)) h=\(Int(f.height))"
+            emit("WINDOW_FRAME x=\(Int(f.minX)) y=\(Int(f.minY)) w=\(Int(f.width)) h=\(Int(f.height))"
                   + " screen=\(Int(screen.frame.width))x\(Int(screen.frame.height)) scale=\(Int(screen.backingScaleFactor))")
         }
 
@@ -904,6 +956,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
             let start = Int(ProcessInfo.processInfo.environment["MUSE_START_SLOT"] ?? "")
                 .flatMap { slot in accounts.firstIndex(where: { $0.slot == slot }) } ?? 0
             select(start)
+            warnIfStoreFrozen()
             if KEYTEST, let other = accounts.indices.first(where: { $0 != start }) {
                 // 自檢：3 秒後自動切到另一個帳號，看第一響應者有沒有跟著換過去
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
@@ -954,7 +1007,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
     """
 
     /// 載入後（或切換到該帳號時）重新計算指紋；同一帳號 3 分鐘內不重複算
-    func scheduleFingerprint(for index: Int, attempt: Int = 0) {
+    func scheduleFingeremit(for index: Int, attempt: Int = 0) {
         if DEMO { return }
         guard accounts.indices.contains(index) else { return }
         let acc = accounts[index]
@@ -976,16 +1029,16 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                       let n = obj["n"] as? Int, let hash = obj["hash"] as? String,
                       let idx = self.accounts.firstIndex(where: { $0.storeID == storeID }) else { return }
                 let items = (obj["items"] as? [String]) ?? []
-                print("FP name=\(self.accounts[idx].name) n=\(n) hash=\(hash) items=\(items.prefix(3))")
+                emit("FP name=\(self.accounts[idx].name) n=\(n) hash=\(hash) items=\(items.prefix(3))")
                 guard n >= 2 else {
                     if attempt == 0 {
                         // 樣本不足：可能清單還沒載完，稍後再試一次
                         self.fpAt[storeID] = .distantPast
-                        self.scheduleFingerprint(for: idx, attempt: 1)
+                        self.scheduleFingeremit(for: idx, attempt: 1)
                     } else if !self.accounts[idx].fpItems.isEmpty {
                         // 兩次都拿不到（多半是 WebView 被切走、隱藏頁不 hydrate）：
                         // 空樣本蓋掉既有指紋會讓重複偵測失效，寧可留著舊的
-                        print("FP_KEEP name=\(self.accounts[idx].name) n=\(n) keep=\(self.accounts[idx].fpItems.count)")
+                        emit("FP_KEEP name=\(self.accounts[idx].name) n=\(n) keep=\(self.accounts[idx].fpItems.count)")
                     }
                     return
                 }
@@ -1010,7 +1063,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
             .map { "\(accounts[$0.key].slot) 號（\(accounts[$0.key].name)）與 \(accounts[$0.value].slot) 號相同" }
             .joined(separator: "、")
         statusLabel.stringValue = "⚠︎ 偵測到重複帳號：" + text
-        print("DUP \(text)")
+        emit("DUP \(text)")
     }
 
     // MARK: 登入狀態即時化
@@ -1066,7 +1119,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                 let api = (obj["api"] as? Int) ?? 0
                 self.lastProbe[storeID] = loggedIn
                 let changed = self.accounts[idx].loggedIn != loggedIn
-                print("LOGIN_PROBE name=\(self.accounts[idx].name) loggedIn=\(loggedIn) api=\(api) changed=\(changed)")
+                emit("LOGIN_PROBE name=\(self.accounts[idx].name) loggedIn=\(loggedIn) api=\(api) changed=\(changed)")
                 guard changed else { return }
                 self.accounts[idx].loggedIn = loggedIn
                 Store.save(self.accounts)
@@ -1110,7 +1163,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                 guard case .success(let v) = r, let text = v as? String,
                       let data = text.data(using: .utf8),
                       let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-                    print("AVATAR_ERR \(r)")
+                    emit("AVATAR_ERR \(r)")
                     return
                 }
                 guard (obj["ok"] as? Bool) == true,
@@ -1118,17 +1171,17 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                       let png = AvatarStore.decodeDataURL(url) else {
                     let why = (obj["why"] as? String) ?? "?"
                     if attempt < 2, let idx = self.accounts.firstIndex(where: { $0.storeID == storeID }) {
-                        print("AVATAR_RETRY store=\(storeID.prefix(8)) why=\(why) attempt=\(attempt + 1)")
+                        emit("AVATAR_RETRY store=\(storeID.prefix(8)) why=\(why) attempt=\(attempt + 1)")
                         self.avatarAt.removeValue(forKey: storeID)   // 重試要繞過 60 秒節流
                         self.scheduleAvatarCapture(for: idx, attempt: attempt + 1)
                     } else {
-                        print("AVATAR_GIVEUP store=\(storeID.prefix(8)) why=\(why)")
+                        emit("AVATAR_GIVEUP store=\(storeID.prefix(8)) why=\(why)")
                     }
                     return
                 }
                 guard AvatarStore.save(png: png, for: storeID) else { return }
                 let name = self.accounts.first(where: { $0.storeID == storeID })?.name ?? "?"
-                print("AVATAR name=\(name) bytes=\(png.count) vw=\(obj["vw"] ?? 0) vh=\(obj["vh"] ?? 0) crop=\(obj["crop"] ?? "?") at=\(AvatarStore.file(for: storeID).lastPathComponent)")
+                emit("AVATAR name=\(name) bytes=\(png.count) vw=\(obj["vw"] ?? 0) vh=\(obj["vh"] ?? 0) crop=\(obj["crop"] ?? "?") at=\(AvatarStore.file(for: storeID).lastPathComponent)")
                 self.rebuildCards()
             }
         }
@@ -1271,11 +1324,11 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         window.makeFirstResponder(w)
         if w.url == nil { w.load(URLRequest(url: url)) }
         lastActiveAt[accounts[index].storeID] = Date()   // 這個帳號現在是「在用」，不准被釋放
-        scheduleFingerprint(for: index)
+        scheduleFingeremit(for: index)
         scheduleLoginProbe(for: index)
         scheduleAvatarCapture(for: index)
         window.title = "MuseDock — \(accounts[index].name)"
-        statusLabel.stringValue = "⇧⌘\(index + 1) 切換 · \(accounts[index].name)"
+        statusLabel.stringValue = subtitle(for: index)
         scheduleComposerFocus(for: index)
         if KEYTEST {
             reportKeyRoute("idx=\(index) slot=\(accounts[index].slot) t=0")
@@ -1305,7 +1358,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
             cur = v.superview
         }
         let chain = path.isEmpty ? "nil" : path.joined(separator: " < ")
-        print("KEYTEST \(tag) pasteMenu=\(pasteFound ? "OK" : "MISSING") inWebView=\(inWeb) responder=\(chain)")
+        emit("KEYTEST \(tag) pasteMenu=\(pasteFound ? "OK" : "MISSING") inWebView=\(inWeb) responder=\(chain)")
     }
 
     /// 自檢：真的走一次貼上。造一個 contenteditable、把一段字塞進系統剪貼板，
@@ -1314,7 +1367,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
     /// 自檢：真的走一次貼上。先備份剪貼板，結束後還原——不要毀掉使用者正在用的內容。
     func pasteProbe(tag: String, _ completion: @escaping (Bool) -> Void) {
         guard accounts.indices.contains(current), let w = webViews[accounts[current].storeID] else {
-            print("PASTETEST tag=\(tag) result=FAIL why=no-webview"); completion(false); return
+            emit("PASTETEST tag=\(tag) result=FAIL why=no-webview"); completion(false); return
         }
         let pb = NSPasteboard.general
         let saved = pb.string(forType: .string)
@@ -1347,7 +1400,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         w.evaluateJavaScript(mk) { focusState, err in
             guard (focusState as? String) == "focused" else {
                 restoreClipboard()
-                print("PASTETEST tag=\(tag) token=\(token) focus=\(focusState ?? "nil") err=\(err?.localizedDescription ?? "-") result=FAIL")
+                emit("PASTETEST tag=\(tag) token=\(token) focus=\(focusState ?? "nil") err=\(err?.localizedDescription ?? "-") result=FAIL")
                 completion(false)
                 return
             }
@@ -1358,7 +1411,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                     restoreClipboard()
                     let got = (v as? String) ?? ""
                     let ok = got == token
-                    print("PASTETEST tag=\(tag) token=\(token) dispatched=\(dispatched) key=\(NSApp.keyWindow != nil) got=\(got.prefix(40)) result=\(ok ? "PASS" : "FAIL")")
+                    emit("PASTETEST tag=\(tag) token=\(token) dispatched=\(dispatched) key=\(NSApp.keyWindow != nil) got=\(got.prefix(40)) result=\(ok ? "PASS" : "FAIL")")
                     completion(ok)
                 }
             }
@@ -1376,7 +1429,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
     /// 用注入的透明 textarea 當落點，不去動真實帳號的 composer 草稿。
     func pasteViaMenuProbe(tag: String, noBlur: Bool = false, _ completion: @escaping (Bool) -> Void) {
         guard accounts.indices.contains(current), let w = webViews[accounts[current].storeID] else {
-            print("PASTEMENU tag=\(tag) result=FAIL why=no-webview"); completion(false); return
+            emit("PASTEMENU tag=\(tag) result=FAIL why=no-webview"); completion(false); return
         }
         let pb = NSPasteboard.general
         let saved = pb.string(forType: .string)
@@ -1401,7 +1454,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         w.evaluateJavaScript(mk) { before, _ in
             pb.clearContents()
             pb.setString(token, forType: .string)
-            print("PASTEMENU tag=\(tag) after-blur=\(before ?? "nil")")
+            emit("PASTEMENU tag=\(tag) after-blur=\(before ?? "nil")")
             self.pasteIntoPage(nil)                 // ← 生產路徑：選單「貼上」
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
                 let read = """
@@ -1419,7 +1472,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                     w.evaluateJavaScript("(function(){var e=document.getElementById('__md_ta'); if(e)e.remove();})()") { _, _ in }
                     let raw = (v as? String) ?? ""
                     let ok = raw.contains(token)
-                    print("PASTEMENU tag=\(tag) token=\(token) landed=\(ok) where=\(raw) result=\(ok ? "PASS" : "FAIL")")
+                    emit("PASTEMENU tag=\(tag) token=\(token) landed=\(ok) where=\(raw) result=\(ok ? "PASS" : "FAIL")")
                     completion(ok)
                 }
             }
@@ -1553,11 +1606,11 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
             switch r {
             case .success(let v):
                 let state = (v as? String) ?? "?"
-                print("PASTE_ROUTE name=\(self.accounts[self.current].name) focus=\(state)")
+                emit("PASTE_ROUTE name=\(self.accounts[self.current].name) focus=\(state)")
                 // 焦點本來就在輸入框 → EditorState 是對的，立刻貼，不讓使用者等
                 if state.hasPrefix("already") { wait = 0 }
             case .failure(let e):
-                print("PASTE_ROUTE name=\(self.accounts[self.current].name) js=\(e.localizedDescription.prefix(40))")
+                emit("PASTE_ROUTE name=\(self.accounts[self.current].name) js=\(e.localizedDescription.prefix(40))")
             }
             // 剛改過焦點的話，WebKit 內部的 EditorState 要一次 IPC 往返才跟上；
             // 立刻 paste: 會貼到舊位置（實測 0.15s 不夠、0.5s 可以）
@@ -1590,7 +1643,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                 case .success(let v): state = (v as? String) ?? "?"
                 case .failure(let e): state = "err:\(e.localizedDescription.prefix(50))"
                 }
-                print("FOCUS name=\(self.accounts[index].name) attempt=\(attempt) state=\(state)")
+                emit("FOCUS name=\(self.accounts[index].name) attempt=\(attempt) state=\(state)")
                 if (state == "none" || state.hasPrefix("err")), attempt < 2 {
                     self.scheduleComposerFocus(for: index, attempt: attempt + 1)
                 }
@@ -1612,7 +1665,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         }
         t.tolerance = tick * 0.2        // 省電：允許系統合併計時器
         idleTimer = t
-        print("IDLE_TIMER tick=\(Int(tick))s releaseAfter=\(Int(idleReleaseAfter))s")
+        emit("IDLE_TIMER tick=\(Int(tick))s releaseAfter=\(Int(idleReleaseAfter))s")
     }
 
     func releaseIdleWebViews() {
@@ -1640,37 +1693,37 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         fpAt.removeValue(forKey: storeID)
         avatarBusy.remove(storeID)          // 抽幀的閉包會因 webView 消失而提前返回
         let name = accounts.first(where: { $0.storeID == storeID })?.name ?? "?"
-        print("RELEASE name=\(name) \(reason) remain=\(webViews.count)")
+        emit("RELEASE name=\(name) \(reason) remain=\(webViews.count)")
     }
 
     /// 自測：`MUSE_IDLE_TEST=1 MUSE_IDLE_RELEASE_SEC=10`
     /// 開 1 號 → 切到 2 號 → 等門檻過去，1 號的 WebView 應該被釋放、2 號留下。
     func runIdleTest() {
-        guard accounts.count >= 2 else { print("IDLE_TEST need two accounts"); exit(9) }
+        guard accounts.count >= 2 else { emit("IDLE_TEST need two accounts"); exit(9) }
         // 自測要走真實路徑（選單 → 回應鏈），所以視窗必須是 key；
         // 只 orderFront 的話 NSApp.sendAction 找不到 WKContentView，會誤判成「貼不上」。
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            print("IDLE_TEST window key=\(self.window.isKeyWindow) appActive=\(NSApp.isActive)")
+            emit("IDLE_TEST window key=\(self.window.isKeyWindow) appActive=\(NSApp.isActive)")
         }
         select(0)
-        print("IDLE_TEST step1 select=\(accounts[0].name)")
+        emit("IDLE_TEST step1 select=\(accounts[0].name)")
 
         // 段 A：沒被釋放的情況下切走再切回，DOM 焦點會不會掉？
         // 這一格決定「每次切換都要補焦點」還是「只有重建才要」。
         DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
             self.probeFocus { s in
-                print("IDLE_TEST focus1 name=\(self.accounts[0].name) after-select=\(s)")
+                emit("IDLE_TEST focus1 name=\(self.accounts[0].name) after-select=\(s)")
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
-            print("IDLE_TEST step2 switch=\(self.accounts[1].name) webViews=\(self.webViews.count)")
+            emit("IDLE_TEST step2 switch=\(self.accounts[1].name) webViews=\(self.webViews.count)")
             self.select(1)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 22) {
             self.probeFocus { s in
-                print("IDLE_TEST focus2 name=\(self.accounts[1].name) after-switch=\(s)")
+                emit("IDLE_TEST focus2 name=\(self.accounts[1].name) after-switch=\(s)")
             }
         }
 
@@ -1678,30 +1731,30 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
             let names = self.webViews.keys.compactMap { id in
                 self.accounts.first(where: { $0.storeID == id })?.name
             }
-            print("IDLE_TEST end webViews=\(self.webViews.count) keep=\(names)")
+            emit("IDLE_TEST end webViews=\(self.webViews.count) keep=\(names)")
             let released = self.webViews.count == 1
-            print("IDLE_TEST result1 \(released ? "PASS" : "FAIL")（閒置者已釋放）")
+            emit("IDLE_TEST result1 \(released ? "PASS" : "FAIL")（閒置者已釋放）")
 
             // 回到被釋放的帳號：cookie 在磁碟上，應該直接載入已登入頁面
             self.lastProbe[self.accounts[0].storeID] = nil      // 清掉舊結果，只認這次探測
             self.select(0)
-            print("IDLE_TEST rehydrate select=\(self.accounts[0].name) webViews=\(self.webViews.count)")
+            emit("IDLE_TEST rehydrate select=\(self.accounts[0].name) webViews=\(self.webViews.count)")
 
             DispatchQueue.main.asyncAfter(deadline: .now() + 18) {
                 let back = self.lastProbe[self.accounts[0].storeID] == true
-                print("IDLE_TEST rehydrate name=\(self.accounts[0].name) loggedIn=\(String(describing: self.lastProbe[self.accounts[0].storeID])) webViews=\(self.webViews.count)")
-                print("IDLE_TEST result2 \(back ? "PASS" : "FAIL")（重建後仍登入）")
+                emit("IDLE_TEST rehydrate name=\(self.accounts[0].name) loggedIn=\(String(describing: self.lastProbe[self.accounts[0].storeID])) webViews=\(self.webViews.count)")
+                emit("IDLE_TEST result2 \(back ? "PASS" : "FAIL")（重建後仍登入）")
                 self.probeFocus { s in
-                    print("IDLE_TEST focus3 name=\(self.accounts[0].name) after-rehydrate=\(s)")
+                    emit("IDLE_TEST focus3 name=\(self.accounts[0].name) after-rehydrate=\(s)")
                     let focused = s.hasPrefix("input:")
-                    print("IDLE_TEST result3 \(focused ? "PASS" : "FAIL")（重建後游標已在輸入框）")
+                    emit("IDLE_TEST result3 \(focused ? "PASS" : "FAIL")（重建後游標已在輸入框）")
                     self.pasteProbe(tag: "rehydrate") { ok in
-                        print("IDLE_TEST result4 \(ok ? "PASS" : "FAIL")（重建後直接 ⌘V 貼得上）")
+                        emit("IDLE_TEST result4 \(ok ? "PASS" : "FAIL")（重建後直接 ⌘V 貼得上）")
                         // 再把焦點打成 body（頁面重繪後就是這樣），走一次真正的選單路徑
                         self.pasteViaMenuProbe(tag: "body-focus") { menuOK in
-                            print("IDLE_TEST result5 \(menuOK ? "PASS" : "FAIL")（失焦到 body 後 ⌘V 仍貼得上）")
+                            emit("IDLE_TEST result5 \(menuOK ? "PASS" : "FAIL")（失焦到 body 後 ⌘V 仍貼得上）")
                             self.pasteViaMenuProbe(tag: "already-focus", noBlur: true) { fastOK in
-                                print("IDLE_TEST result6 \(fastOK ? "PASS" : "FAIL")（焦點已在輸入框時直接貼）")
+                                emit("IDLE_TEST result6 \(fastOK ? "PASS" : "FAIL")（焦點已在輸入框時直接貼）")
                                 exit((released && back && focused && ok && menuOK && fastOK) ? 0 : 7)
                             }
                         }
@@ -1715,23 +1768,23 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
     /// 影格在頁面載入 8 秒後抽，失敗會再試兩次（5 秒間隔），所以等 45 秒才判定。
     func runAvatarTest(slot: Int) {
         guard let idx = accounts.firstIndex(where: { $0.slot == slot }) else {
-            print("AVATAR_TEST no such slot \(slot)"); exit(3)
+            emit("AVATAR_TEST no such slot \(slot)"); exit(3)
         }
         window.orderFrontRegardless()       // 影片要真的解碼才抽得到幀
         let storeID = accounts[idx].storeID
         AvatarStore.remove(for: storeID)
         avatarAt.removeValue(forKey: storeID)
         select(idx)
-        print("AVATAR_TEST start slot=\(slot) name=\(accounts[idx].name) loggedIn=\(accounts[idx].loggedIn)")
-        print("AVATAR_TEST dir=\(AvatarStore.dir.path)")
+        emit("AVATAR_TEST start slot=\(slot) name=\(accounts[idx].name) loggedIn=\(accounts[idx].loggedIn)")
+        emit("AVATAR_TEST dir=\(AvatarStore.dir.path)")
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 45) {
             let f = AvatarStore.file(for: storeID)
             let exists = FileManager.default.fileExists(atPath: f.path)
             let bytes = (try? Data(contentsOf: f))?.count ?? 0
-            print("AVATAR_TEST file=\(f.lastPathComponent) exists=\(exists) bytes=\(bytes) cacheCount=\(AvatarStore.count()) visible=\(self.window.isVisible)")
+            emit("AVATAR_TEST file=\(f.lastPathComponent) exists=\(exists) bytes=\(bytes) cacheCount=\(AvatarStore.count()) visible=\(self.window.isVisible)")
             let ok = exists && bytes > 1000 && AvatarStore.image(for: storeID) != nil
-            print("AVATAR_TEST result \(ok ? "PASS" : "FAIL")")
+            emit("AVATAR_TEST result \(ok ? "PASS" : "FAIL")")
             exit(ok ? 0 : 9)
         }
     }
@@ -1758,7 +1811,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         w.allowsBackForwardNavigationGestures = true
         webViews[acc.storeID] = w
         lastActiveAt[acc.storeID] = Date()
-        if webViews.count > 1 { print("WEBVIEW rebuilt name=\(acc.name) total=\(webViews.count)") }
+        if webViews.count > 1 { emit("WEBVIEW rebuilt name=\(acc.name) total=\(webViews.count)") }
         return w
     }
 
@@ -1994,16 +2047,16 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
             if svc.status == .enabled {
                 try svc.unregister()
                 statusLabel.stringValue = "已關閉開機自動啟動"
-                print("AUTOSTART off status=\(svc.status.rawValue)")
+                emit("AUTOSTART off status=\(svc.status.rawValue)")
             } else {
                 try svc.register()
                 statusLabel.stringValue = svc.status == .requiresApproval
                     ? "請到「系統設定 › 一般 › 登入項目」允許 MuseDock"
                     : "已設定開機自動啟動"
-                print("AUTOSTART on status=\(svc.status.rawValue)")
+                emit("AUTOSTART on status=\(svc.status.rawValue)")
             }
         } catch {
-            print("AUTOSTART err \(error.localizedDescription) status=\(svc.status.rawValue)")
+            emit("AUTOSTART err \(error.localizedDescription) status=\(svc.status.rawValue)")
             let a = NSAlert()
             a.alertStyle = .warning
             a.messageText = "無法設定開機自動啟動"
@@ -2019,9 +2072,9 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         let svc = SMAppService.mainApp
         switch cmd {
         case "on":
-            do { try svc.register() } catch { print("AUTOSTART_ERR \(error.localizedDescription)") }
+            do { try svc.register() } catch { emit("AUTOSTART_ERR \(error.localizedDescription)") }
         case "off":
-            do { try svc.unregister() } catch { print("AUTOSTART_ERR \(error.localizedDescription)") }
+            do { try svc.unregister() } catch { emit("AUTOSTART_ERR \(error.localizedDescription)") }
         default:
             break
         }
@@ -2033,7 +2086,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         case .notFound: state = "notFound"
         @unknown default: state = "unknown(\(svc.status.rawValue))"
         }
-        print("AUTOSTART cmd=\(cmd) status=\(state)")
+        emit("AUTOSTART cmd=\(cmd) status=\(state)")
     }
 
     @objc func toggleWindow() {
@@ -2204,7 +2257,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                 self?.statusLabel.stringValue = removed
                     ? "已刪除 \(acc.name)（編號 ⇧\(acc.slot) 保留不重用）\(freed)"
                     : "已刪除 \(acc.name)，但資料目錄殘留（\(detail)）"
-                print("PURGE slot=\(acc.slot) store=\(acc.storeID) removed=\(removed) \(detail)")
+                emit("PURGE slot=\(acc.slot) store=\(acc.storeID) removed=\(removed) \(detail)")
                 onPurged?(removed, detail)
             }
         }
@@ -2281,7 +2334,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                     self.statusLabel.stringValue = removed
                         ? "已清除 \(acc.name) 的所有網站資料（含快取目錄）\(freed)"
                         : "已清除 \(acc.name) 的資料，但目錄殘留（\(detail)）"
-                    print("WIPE slot=\(acc.slot) store=\(storeID) removedDir=\(removed) \(detail)")
+                    emit("WIPE slot=\(acc.slot) store=\(storeID) removedDir=\(removed) \(detail)")
                     // 重建乾淨的 WebView（會讓 WebKit 重新建立一個空目錄）
                     if self.webViews[storeID] == nil, self.accounts.indices.contains(index) {
                         self.select(index)
@@ -2343,58 +2396,58 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
     /// 依編號清除網站資料（保留帳號），供自測使用。走的是 UI 的同一條路徑。
     func wipeBySlot(slot: Int) {
         guard let idx = accounts.firstIndex(where: { $0.slot == slot }) else {
-            print("ERR_NO_SLOT \(slot)"); exit(3)
+            emit("ERR_NO_SLOT \(slot)"); exit(3)
         }
         let name = accounts[idx].name
         let storeID = accounts[idx].storeID
         let before = Store.websiteDataSize(for: storeID) ?? "none"
-        print("WIPING slot=\(slot) name=\(name) dir_before=\(before)")
+        emit("WIPING slot=\(slot) name=\(name) dir_before=\(before)")
         wipeAccount(at: idx) { removed, detail in
-            print("WIPE_DIR removed=\(removed) \(detail) (before \(before))")
+            emit("WIPE_DIR removed=\(removed) \(detail) (before \(before))")
             let after = Store.websiteDataSize(for: storeID) ?? "none"
-            print("DIR_AFTER \(after)")
+            emit("DIR_AFTER \(after)")
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { exit(0) }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { print("WIPE timeout"); exit(0) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 20) { emit("WIPE timeout"); exit(0) }
     }
 
     /// 依編號移除帳號並清空其隔離存儲（供自測／維護使用）。走的是 UI 刪除的同一條路徑。
     func dropAccount(slot: Int) {
         guard let idx = accounts.firstIndex(where: { $0.slot == slot }) else {
-            print("ERR_NO_SLOT \(slot)"); exit(3)
+            emit("ERR_NO_SLOT \(slot)"); exit(3)
         }
         let name = accounts[idx].name
         let storeID = accounts[idx].storeID
         let before = Store.websiteDataSize(for: storeID) ?? "none"
-        print("DROPPING slot=\(slot) name=\(name) dir_before=\(before)")
+        emit("DROPPING slot=\(slot) name=\(name) dir_before=\(before)")
         performDelete(at: idx) { removed, detail in
-            print("PURGE_DIR removed=\(removed) \(detail) (before \(before))")
+            emit("PURGE_DIR removed=\(removed) \(detail) (before \(before))")
             exit(0)
         }
-        print("DROPPED slot=\(slot) name=\(name) remain=\(accounts.count)")
+        emit("DROPPED slot=\(slot) name=\(name) remain=\(accounts.count)")
         DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
-            print("DROP timeout"); exit(0)
+            emit("DROP timeout"); exit(0)
         }
     }
 
     /// 診斷用：載入指定編號帳號並輸出頁面上的帳號資訊
     func probeWho(slot: Int) {
         guard let idx = accounts.firstIndex(where: { $0.slot == slot }) else {
-            print("ERR_SLOT \(slot)"); exit(3)
+            emit("ERR_SLOT \(slot)"); exit(3)
         }
-        print("WHO_START slot=\(slot) name=\(accounts[idx].name)")
+        emit("WHO_START slot=\(slot) name=\(accounts[idx].name)")
         select(idx)
     }
 
     /// 命令列自測用：把頁面上所有可能是頭像的資源倒出來（img / 背景圖 / avatar 容器）
     func probeAvatar(slot: Int) {
         guard let idx = accounts.firstIndex(where: { $0.slot == slot }) else {
-            print("ERR_SLOT \(slot)"); exit(3)
+            emit("ERR_SLOT \(slot)"); exit(3)
         }
-        print("AVATAR_START slot=\(slot) name=\(accounts[idx].name) store=\(accounts[idx].storeID)")
+        emit("AVATAR_START slot=\(slot) name=\(accounts[idx].name) store=\(accounts[idx].storeID)")
         select(idx)
         DispatchQueue.main.asyncAfter(deadline: .now() + 45) {
-            print("AVATAR_TIMEOUT")
+            emit("AVATAR_TIMEOUT")
             exit(6)
         }
     }
@@ -2403,18 +2456,18 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
     func applyChromeImport(dir: String) {
         chromeProfiles = ChromeCookies.profiles()
         guard let p = chromeProfiles.first(where: { $0.dir == dir }) else {
-            print("ERR_NO_PROFILE \(dir)"); exit(3)
+            emit("ERR_NO_PROFILE \(dir)"); exit(3)
         }
-        guard !accounts.isEmpty else { print("ERR_NO_ACCOUNT"); exit(4) }
+        guard !accounts.isEmpty else { emit("ERR_NO_ACCOUNT"); exit(4) }
         let idx = accounts.firstIndex { $0.name == p.name }
             ?? accounts.firstIndex { $0.name.lowercased() == p.name.lowercased() } ?? current
-        print("CHROME_APPLY dir=\(dir) profile=\(p.name) target=\(accounts[idx].name)")
+        emit("CHROME_APPLY dir=\(dir) profile=\(p.name) target=\(accounts[idx].name)")
         do {
             let cookies = try ChromeCookies.cookies(for: dir)
-            print("CHROME_APPLY cookies=\(cookies.count)")
+            emit("CHROME_APPLY cookies=\(cookies.count)")
             install(cookies: cookies, into: idx, source: " \(dir) ", email: p.email, profileDir: dir)
         } catch {
-            print("CHROME_APPLY_ERR \(error.localizedDescription)")
+            emit("CHROME_APPLY_ERR \(error.localizedDescription)")
             exit(9)
         }
     }
@@ -2496,16 +2549,16 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
 
     func runImport(account key: String, file: String) {
         guard let idx = accounts.firstIndex(where: { String($0.slot) == key || $0.name == key }) else {
-            print("ERR_NO_ACCOUNT key=\(key)")
+            emit("ERR_NO_ACCOUNT key=\(key)")
             exit(3)
         }
         guard let text = try? String(contentsOfFile: file, encoding: .utf8) else {
-            print("ERR_READ_FILE \(file)")
+            emit("ERR_READ_FILE \(file)")
             exit(4)
         }
         let cookies = CookieParser.parse(netscape: text)
         let acc = accounts[idx]
-        print("IMPORT account=\(acc.name) slot=\(acc.slot) parsed=\(cookies.count)")
+        emit("IMPORT account=\(acc.name) slot=\(acc.slot) parsed=\(cookies.count)")
         guard !cookies.isEmpty else { exit(5) }
 
         let store = WKWebsiteDataStore(forIdentifier: UUID(uuidString: acc.storeID)!)
@@ -2514,7 +2567,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         g.notify(queue: .main) {
             store.httpCookieStore.getAllCookies { list in
                 let muse = list.filter { $0.domain.contains("muse") }
-                print("STORE total=\(list.count) muse=\(muse.count) sess=\(muse.contains { $0.name == "hatch_sess" })")
+                emit("STORE total=\(list.count) muse=\(muse.count) sess=\(muse.contains { $0.name == "hatch_sess" })")
                 if idx < self.accounts.count {
                     self.accounts[idx].loggedIn = true
                     Store.save(self.accounts)
@@ -2522,7 +2575,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                 self.select(idx)
                 self.webView(for: idx).load(URLRequest(url: URL(string: "https://muse.ai")!))
                 DispatchQueue.main.asyncAfter(deadline: .now() + 40) {
-                    print("RESULT timeout")
+                    emit("RESULT timeout")
                     exit(6)
                 }
             }
@@ -2541,7 +2594,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         if webView.url?.host?.contains("muse.ai") == true,
            let idx = accounts.firstIndex(where: { webViews[$0.storeID] === webView }) {
-            scheduleFingerprint(for: idx)
+            scheduleFingeremit(for: idx)
             scheduleLoginProbe(for: idx)
             scheduleAvatarCapture(for: idx)
             scheduleComposerFocus(for: idx)   // 頁面載完才有 composer，這裡再試一次
@@ -2658,11 +2711,11 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                 let sel = ProcessInfo.processInfo.environment["MUSE_AVATAR_CLICK"] ?? ""
                 webView.callAsyncJavaScript(js, arguments: ["clickSel": sel], in: nil, in: .page) { r in
                     switch r {
-                    case .success(let v): print("AVATAR \(v)")
+                    case .success(let v): emit("AVATAR \(v)")
                     case .failure(let e):
                         let ns = e as NSError
-                        print("AVATAR_ERR \(e.localizedDescription)")
-                        print("AVATAR_ERR_DETAIL \(ns.userInfo)")
+                        emit("AVATAR_ERR \(e.localizedDescription)")
+                        emit("AVATAR_ERR_DETAIL \(ns.userInfo)")
                     }
                     let cfg = WKSnapshotConfiguration()
                     cfg.rect = webView.bounds
@@ -2710,8 +2763,8 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                 """
                 webView.callAsyncJavaScript(js, arguments: [:], in: nil, in: .page) { r in
                     switch r {
-                    case .success(let v): print("WHO \(v)")
-                    case .failure(let e): print("WHO_ERR \(e.localizedDescription)")
+                    case .success(let v): emit("WHO \(v)")
+                    case .failure(let e): emit("WHO_ERR \(e.localizedDescription)")
                     }
                     let cfg = WKSnapshotConfiguration()
                     cfg.rect = webView.bounds
@@ -2730,7 +2783,7 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         if PROBE_MODE && !importFired && webView.url?.host?.contains("muse.ai") == true {
             importFired = true
             let wait = Double(ProcessInfo.processInfo.environment["MUSE_PROBE_WAIT"] ?? "8") ?? 8
-            print("PROBE wait=\(wait)s")
+            emit("PROBE wait=\(wait)s")
             DispatchQueue.main.asyncAfter(deadline: .now() + wait) {
                 let js = """
                 return await (async () => {
@@ -2800,11 +2853,11 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                            let rep = NSBitmapImageRep(data: tiff),
                            let png = rep.representation(using: .png, properties: [:]) {
                             try? png.write(to: URL(fileURLWithPath: "/tmp/musedock_page.png"))
-                            print("SNAP ok \(Int(img.size.width))x\(Int(img.size.height))")
+                            emit("SNAP ok \(Int(img.size.width))x\(Int(img.size.height))")
                         } else {
-                            print("SNAP fail \(String(describing: err))")
+                            emit("SNAP fail \(String(describing: err))")
                         }
-                        print("RESULT done")
+                        emit("RESULT done")
                         exit(0)
                     }
                 }
@@ -2814,15 +2867,15 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                         var signedIn = false
                         switch result {
                         case .success(let v):
-                            print("PAGE \(v)")
+                            emit("PAGE \(v)")
                             signedIn = String(describing: v).contains("\"loggedIn\":true")
                             if self.current < self.accounts.count {
                                 self.accounts[self.current].loggedIn = signedIn
                                 Store.save(self.accounts)
-                                print("LOGIN name=\(self.accounts[self.current].name) loggedIn=\(signedIn)")
+                                emit("LOGIN name=\(self.accounts[self.current].name) loggedIn=\(signedIn)")
                             }
                         case .failure(let e):
-                            print("JSERR \(e.localizedDescription)")
+                            emit("JSERR \(e.localizedDescription)")
                             if self.current < self.accounts.count {
                                 self.accounts[self.current].loggedIn = false
                                 Store.save(self.accounts)
@@ -2833,8 +2886,8 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
                         if !signedIn && auto && !autoTried {
                             autoTried = true
                             webView.callAsyncJavaScript(clickJS, arguments: [:], in: nil, in: .page) { r in
-                                if case .success(let cv) = r { print("AUTOLOGIN \(cv)") }
-                                else { print("AUTOLOGIN js-fail") }
+                                if case .success(let cv) = r { emit("AUTOLOGIN \(cv)") }
+                                else { emit("AUTOLOGIN js-fail") }
                                 DispatchQueue.main.asyncAfter(deadline: .now() + 12) { probe() }
                             }
                             return
@@ -2848,7 +2901,34 @@ final class Controller: NSObject, WKNavigationDelegate, NSApplicationDelegate, N
         }
 
         guard let t = webView.title, !t.isEmpty, current < accounts.count else { return }
-        statusLabel.stringValue = "⇧⌘\(current + 1) 切換 · \(accounts[current].name)"
+        statusLabel.stringValue = subtitle(for: current)
+    }
+
+    /// 狀態列主文字。`accounts.json` 讀不懂時把「不寫入」掛在後面——
+    /// 使用者改名字、匯入、刪帳號都會「看起來成功」，不講清楚會被當成 bug 回報。
+    func subtitle(for index: Int) -> String {
+        let base = "⇧⌘\(index + 1) 切換 · \(accounts[index].name)"
+        guard Store.frozen else { return base }
+        return base + " · ⚠︎ 資料檔毀損，本次不寫入"
+    }
+
+    /// 只在 GUI 下提示一次；CLI／自測不彈窗，免得卡住自動流程。
+    func warnIfStoreFrozen() {
+        guard Store.frozen, !PROBE_MODE, WHO_SLOT == nil, AVATAR_SLOT == nil,
+              ProcessInfo.processInfo.environment["MUSE_STORE_SELFTEST"] == nil,
+              !KEYTEST else { return }
+        let a = NSAlert()
+        a.messageText = "accounts.json 讀不懂，已停止寫入"
+        a.informativeText = """
+        檔案存在但內容解析失敗，為了不覆蓋你原有的帳號清單，這次啟動不會寫入任何變更。
+        原檔已備份為 \(Store.brokenBackup ?? "（備份失敗）")（位於 \(Store.dir.path)）。
+
+        可以這樣處理：先把備份改名回 accounts.json 並修好格式，或直接把壞檔移走再啟動。
+        """
+        a.alertStyle = .critical
+        a.addButton(withTitle: "知道了，先開著")
+        a.runModal()
+        emit("STORE_FROZEN alert shown")
     }
 }
 
@@ -2953,16 +3033,82 @@ var avatarFired = false
 func render(_ view: NSView, to path: String) {
     view.layoutSubtreeIfNeeded()
     guard view.bounds.width > 1, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
-        print("render failed: \(path) bounds=\(view.bounds)")
+        emit("render failed: \(path) bounds=\(view.bounds)")
         return
     }
     view.cacheDisplay(in: view.bounds, to: rep)
     guard let png = rep.representation(using: .png, properties: [:]) else { return }
     try? png.write(to: URL(fileURLWithPath: path))
-    print("wrote \(path) \(Int(view.bounds.width))x\(Int(view.bounds.height))")
+    emit("wrote \(path) \(Int(view.bounds.width))x\(Int(view.bounds.height))")
 }
 
 setvbuf(stdout, nil, _IONBF, 0)
+
+// ── 日誌落盤 ─────────────────────────────────────────────────────────────
+// 從 Dock／open 啟動時 stdout 接到 /dev/null，118 個 print 全部消失，
+// 於是每次排查都得「用環境變數重跑一次自測」才能看到結論。改成同時寫檔案：
+// 終端看得到（開發時習慣不變），關掉之後還留一份（使用者回報時能直接要）。
+enum Log {
+    /// 用 MUSE_STATE_DIR 跑示範／自測時，日誌跟著狀態檔走，不污染真實那份
+    static let url: URL = {
+        if let custom = ProcessInfo.processInfo.environment["MUSE_STATE_DIR"], !custom.isEmpty {
+            return URL(fileURLWithPath: custom, isDirectory: true)
+                .appendingPathComponent("musedock.log")
+        }
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/MuseDock.log")
+    }()
+    static let maxBytes = 4 * 1024 * 1024        // 4MB，只留兩份
+    static var handle: FileHandle?
+    static let lock = NSLock()
+    static var writes = 0
+
+    static func setup() {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: url.deletingLastPathComponent(),
+                                withIntermediateDirectories: true)
+        rotateIfNeeded()
+        if !fm.fileExists(atPath: url.path) { fm.createFile(atPath: url.path, contents: nil) }
+        handle = try? FileHandle(forWritingTo: url)
+        _ = try? handle?.seekToEndOfFile()
+    }
+
+    static func rotateIfNeeded() {
+        let fm = FileManager.default
+        let size = (try? fm.attributesOfItem(atPath: url.path))?[.size] as? Int ?? 0
+        guard size > maxBytes else { return }
+        let old = url.appendingPathExtension("1")
+        try? fm.removeItem(at: old)
+        try? fm.moveItem(at: url, to: old)
+    }
+
+    static func write(_ line: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let h = handle, let data = (line + "\n").data(using: .utf8) else { return }
+        try? h.write(contentsOf: data)
+        writes += 1
+        // 每 512 行才查一次大小：長跑（常駐選單列）才不會把目錄 stat 爆
+        if writes % 512 == 0 {
+            let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int ?? 0
+            if size > maxBytes {
+                try? h.close()
+                rotateIfNeeded()
+                handle = try? FileHandle(forWritingTo: url)
+            }
+        }
+    }
+}
+
+Log.setup()
+emit("=== MuseDock \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev") pid=\(getpid()) \(ISO8601DateFormatter().string(from: Date())) log=\(Log.url.path)")
+
+/// 取代 `print`：終端與日誌檔各寫一份。參數語意與 `print` 相同（空格分隔、換行結尾）。
+func emit(_ items: Any...) {
+    let line = items.map { String(describing: $0) }.joined(separator: " ")
+    fputs(line + "\n", stdout)
+    Log.write(line)
+}
 
 // ── 單一實例：只有「一般啟動」與「會寫 accounts.json 的 CLI」才搶鎖 ──
 // 唯讀自測（快照、列 Profile、狀態列結構）允許與執行中的實例並存，
@@ -2973,23 +3119,24 @@ let READONLY_CLI = ["MUSE_CHROME_LIST", "MUSE_CHROME_IMPORT", "MUSE_STATUS_TEST"
                     "MUSE_AVATAR_PROBE"]
     .contains { ENV[$0] != nil }
 let WRITING_CLI = ["MUSE_DROP_SLOT", "MUSE_WIPE_SLOT", "MUSE_IMPORT_FILE", "MUSE_CHROME_APPLY",
-                   "MUSE_STORE_SELFTEST", "MUSE_IDLE_TEST", "MUSE_AVATAR_TEST"]
+                   "MUSE_STORE_SELFTEST", "MUSE_STORE_BROKEN_TEST", "MUSE_IDLE_TEST",
+                   "MUSE_AVATAR_TEST"]
     .contains { ENV[$0] != nil }
 
 var instanceLockFD: Int32 = -1
 if !READONLY_CLI {
     if let fd = InstanceLock.acquire() {
         instanceLockFD = fd          // 保持開啟直到行程結束；close 就等於放鎖
-        print("INSTANCE_LOCK acquired pid=\(getpid())")
+        emit("INSTANCE_LOCK acquired pid=\(getpid())")
     } else {
         let holder = InstanceLock.holderPID().map(String.init) ?? "不明"
         if WRITING_CLI {
             // 寫入型 CLI 絕不與執行中的實例並存，否則兩邊先後寫檔會丟帳號
-            print("REFUSE 另一個 MuseDock 正在執行（pid \(holder)）；此命令會改寫 accounts.json，已中止")
-            print("請先結束它：⌘Q，或選單列 → 結束 MuseDock")
+            emit("REFUSE 另一個 MuseDock 正在執行（pid \(holder)）；此命令會改寫 accounts.json，已中止")
+            emit("請先結束它：⌘Q，或選單列 → 結束 MuseDock")
             exit(3)
         }
-        print("SINGLE_INSTANCE already running pid=\(holder)，已叫回既有視窗")
+        emit("SINGLE_INSTANCE already running pid=\(holder)，已叫回既有視窗")
         InstanceLock.activateExisting()
         exit(0)
     }
@@ -2999,21 +3146,39 @@ if !READONLY_CLI {
 // 搭配外部輪詢使用：一邊跑這個、一邊讓 python 迴圈解析檔案，不該出現任何半截檔。
 if ENV["MUSE_STORE_SELFTEST"] == "1" {
     let list = Store.load()
-    print("STORE_SELFTEST begin accounts=\(list.count) rounds=200")
+    emit("STORE_SELFTEST begin accounts=\(list.count) rounds=200")
     // 故意製造「檔案被外部改過」：只在結尾多一個換行，內容不變。
     // 下一次 Store.save 應該出聲（STORE_CONFLICT），然後照常覆寫。
     if var raw = try? String(contentsOf: Store.file, encoding: .utf8) {
         raw += "\n"
         try? raw.data(using: .utf8)?.write(to: Store.file, options: .atomic)
-        print("STORE_SELFTEST injected external change")
+        emit("STORE_SELFTEST injected external change")
     }
     for i in 0..<200 {
         Store.save(list)
-        if i % 50 == 0 { print("  wrote \(i)") }
+        if i % 50 == 0 { emit("  wrote \(i)") }
     }
     let ok = (try? Data(contentsOf: Store.file)).flatMap { try? JSONDecoder().decode([Account].self, from: $0) } != nil
-    print("STORE_SELFTEST done readable=\(ok) bytes=\((try? Data(contentsOf: Store.file))?.count ?? -1)")
+    emit("STORE_SELFTEST done readable=\(ok) bytes=\((try? Data(contentsOf: Store.file))?.count ?? -1)")
     exit(ok ? 0 : 8)
+}
+
+// 自查：accounts.json 存在但解不出結構時，必須「備份 + 只讀」，絕不能覆蓋成種子帳號。
+// 這條路徑在真實世界對應「舊版 App 讀到新版欄位」——一旦覆蓋就是全帳號消失。
+if ENV["MUSE_STORE_BROKEN_TEST"] == "1" {
+    let before = (try? Data(contentsOf: Store.file)) ?? Data()
+    let list = Store.load()
+    let afterLoad = (try? Data(contentsOf: Store.file)) ?? Data()
+    let backupURL = Store.brokenBackup.map { Store.dir.appendingPathComponent($0) }
+    let backupOK = backupURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+    let backupSame = backupURL.flatMap { try? Data(contentsOf: $0) } == before
+    emit("STORE_BROKEN_TEST bytes=\(before.count) frozen=\(Store.frozen) accounts=\(list.count) backup=\(Store.brokenBackup ?? "nil") backupOK=\(backupOK) backupSame=\(backupSame)")
+    Store.save(list)                       // 應該被 frozen 擋下
+    let afterSave = (try? Data(contentsOf: Store.file)) ?? Data()
+    let unchanged = afterLoad == before && afterSave == before
+    let pass = !before.isEmpty && Store.frozen && backupOK && backupSame && unchanged && list.count == 2
+    emit("STORE_BROKEN_TEST unchanged=\(unchanged) result=\(pass ? "PASS" : "FAIL")")
+    exit(pass ? 0 : 8)
 }
 
 let app = NSApplication.shared
@@ -3022,9 +3187,9 @@ app.setActivationPolicy(.regular)
 // 命令列自測：列出 Chrome Profile
 if ProcessInfo.processInfo.environment["MUSE_CHROME_LIST"] == "1" {
     let list = ChromeCookies.profiles()
-    print("CHROME installed=\(ChromeCookies.isInstalled) profiles=\(list.count)")
+    emit("CHROME installed=\(ChromeCookies.isInstalled) profiles=\(list.count)")
     for p in list {
-        print("  \(p.dir) | \(p.name) | \(p.email) | cookies=\(p.cookieCount) | last=\(p.lastUsedText)")
+        emit("  \(p.dir) | \(p.name) | \(p.email) | cookies=\(p.cookieCount) | last=\(p.lastUsedText)")
     }
     exit(0)
 }
@@ -3033,13 +3198,13 @@ if ProcessInfo.processInfo.environment["MUSE_CHROME_LIST"] == "1" {
 if let dir = ProcessInfo.processInfo.environment["MUSE_CHROME_IMPORT"] {
     do {
         let cookies = try ChromeCookies.cookies(for: dir)
-        print("CHROME_IMPORT dir=\(dir) cookies=\(cookies.count)")
+        emit("CHROME_IMPORT dir=\(dir) cookies=\(cookies.count)")
         for c in cookies where c.name.contains("hatch") || c.name.contains("sess") {
-            print("  \(c.domain) \(c.name) = \(c.value.prefix(12))…")
+            emit("  \(c.domain) \(c.name) = \(c.value.prefix(12))…")
         }
         exit(0)
     } catch {
-        print("CHROME_IMPORT_ERR \(error.localizedDescription)")
+        emit("CHROME_IMPORT_ERR \(error.localizedDescription)")
         exit(9)
     }
 }
@@ -3051,12 +3216,12 @@ app.delegate = controller
 if ProcessInfo.processInfo.environment["MUSE_STATUS_TEST"] == "1" {
     let m = NSMenu()
     controller.rebuildStatusMenu(m)
-    print("STATUS item=\(controller.statusItem != nil) hasIcon=\(controller.statusItem?.button?.image != nil) items=\(m.items.count)")
+    emit("STATUS item=\(controller.statusItem != nil) hasIcon=\(controller.statusItem?.button?.image != nil) items=\(m.items.count)")
     for it in m.items {
-        if it.isSeparatorItem { print("  ---"); continue }
+        if it.isSeparatorItem { emit("  ---"); continue }
         let mark = it.state == .on ? "◉" : "○"
         let sub = it.submenu != nil ? " ▸(\(it.submenu?.items.count ?? 0))" : ""
-        print("  \(mark) \(it.title)\(sub)")
+        emit("  \(mark) \(it.title)\(sub)")
     }
     exit(0)
 }
@@ -3065,10 +3230,10 @@ if ProcessInfo.processInfo.environment["MUSE_STATUS_TEST"] == "1" {
 if ProcessInfo.processInfo.environment["MUSE_CLOSE_TEST"] == "1" {
     DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
         controller.window.performClose(nil)
-        print("AFTER_CLOSE visible=\(controller.window.isVisible) statusItem=\(controller.statusItem != nil)")
+        emit("AFTER_CLOSE visible=\(controller.window.isVisible) statusItem=\(controller.statusItem != nil)")
     }
     DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
-        print("STILL_RUNNING windows=\(NSApp.windows.count)")
+        emit("STILL_RUNNING windows=\(NSApp.windows.count)")
         exit(0)
     }
     app.run()
