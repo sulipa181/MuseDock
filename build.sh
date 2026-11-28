@@ -31,7 +31,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>local.sulipa.musedock</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleVersion</key><string>0.5</string>
-  <key>CFBundleShortVersionString</key><string>0.18</string>
+  <key>CFBundleShortVersionString</key><string>0.19</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>MuseDock</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
