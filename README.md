@@ -38,13 +38,14 @@
 
 ---
 
-## 2. 最近更新（v0.19）
+## 2. 最近更新（v0.20）
 
-**同一個 Chrome Profile 不會再被匯入成兩張卡片——第二次匯入前會先問你。**
+**同一個 Chrome Profile 不會再被匯入成兩張卡片——第二次匯入前會先問你。**（v0.20 修掉一個「建立新帳號」後又被誤問的 UX 瑕疵。）
 
 | 文件 | 給誰 | 內容 |
 |---|---|---|
 | [docs/UPDATE-v0.19.md](docs/UPDATE-v0.19.md) | **使用者** | 匯入前的提示長什麼樣、`already=` 怎麼看、升級 |
+| [docs/CHANGELOG-v0.20.md](docs/CHANGELOG-v0.20.md) | **開發** | v0.20 修的 UX bug（預檢時機）、驗證、影響範圍 |
 | [docs/CHANGELOG-v0.19.md](docs/CHANGELOG-v0.19.md) | **開發** | 預檢為什麼放在解密前、純函式文案、基線修復（`activate` 與 key window）、被否掉的方案、回歸清單 |
 
 **升級／回滾各一條**（`accounts.json` 格式沒變，**不需要重新登入**）：
@@ -161,6 +162,7 @@ docs/screenshot-demo.png 示範截圖（假資料，非真實帳號）
 
 - [docs/ROADMAP.md](docs/ROADMAP.md) — 下一步做什麼、怎麼驗收、自動推進的規則
 - [docs/DEVELOPER.md](docs/DEVELOPER.md) — 接手前先看：資料模型、七個核心流程、22 條踩坑紀錄、§8 診斷與自測入口
+- [docs/CHANGELOG-v0.20.md](docs/CHANGELOG-v0.20.md) — v0.20：修正預檢時機（「建立新帳號」不再被誤問）
 - [docs/CHANGELOG-v0.19.md](docs/CHANGELOG-v0.19.md) — v0.19：匯入前預檢 + 基線修復（含被否掉的方案、回歸清單）
 - [docs/CHANGELOG-v0.18.md](docs/CHANGELOG-v0.18.md) — v0.18：儲存加固與日誌
 - [docs/CHANGELOG-v0.17.md](docs/CHANGELOG-v0.17.md) — v0.17：輸入焦點與貼上路徑
@@ -169,6 +171,7 @@ docs/screenshot-demo.png 示範截圖（假資料，非真實帳號）
 
 | 版本 | 主題 |
 |---|---|
+| [v0.20](docs/CHANGELOG-v0.20.md) | 修正預檢時機（建立新帳號不再被誤問） |
 | [v0.19](docs/CHANGELOG-v0.19.md) | 匯入前預檢重複帳號（`already=`、`MUSE_IMPORT_PRECHECK`）、基線修復 |
 | [v0.17](docs/CHANGELOG-v0.17.md) | 切換帳號後直接 `⌘V` 就能貼（DOM 焦點 / 貼上路徑） |
 | [v0.16](docs/CHANGELOG-v0.16.md) | 補「編輯」選單、交還第一響應者 |

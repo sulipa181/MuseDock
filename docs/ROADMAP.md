@@ -2,7 +2,7 @@
 
 這份檔案是「不用每次下指令」的依據。每次自動推進時，先讀這裡，挑一項做完，回來更新它。
 
-**目前版本：v0.19**
+**目前版本：v0.20**
 
 ---
 
@@ -99,7 +99,7 @@
 3. **動手後跑同一組**，全 PASS 才算完成；任何一項 FAIL 就回退該項改動（`git checkout -- <檔案>`）。
 4. **文件同步**：`docs/DEVELOPER.md`（相關章節 + 坑，若踩到新的）、`docs/CHANGELOG-vX.md`、
    `docs/UPDATE-vX.md`、README 的版本與索引。
-5. **發版**：`./tools/release.sh <新版本> --test`。小版本遞增（0.19 → 0.20）。
+5. **發版**：`./tools/release.sh <新版本> --test`。小版本遞增（0.20 → 0.21）。
 6. **卡住就停**：需要使用者決策（例如要不要改檔案格式）或需要真實帳號操作時，寫進第 3 節並結束，
    不要自己猜。
 
@@ -151,6 +151,7 @@ MUSE_IMPORT_PRECHECK="Profile 11" ./MuseDock.app/Contents/MacOS/MuseDock | grep 
 
 | 版本 | 項目 |
 |---|---|
+| 0.20 | 修正 v0.19 匯入預檢的時機：預檢提前到目標解析之前，「建立新帳號」不再被誤問「已匯入過」；`ownerOf` 忽略空 `profileDir` |
 | 0.19 | 匯入前預檢重複帳號（`ownerOf(profileDir:)` + `confirmReimport` + `MUSE_CHROME_LIST already=<slot>` + `MUSE_IMPORT_PRECHECK`）；基線修復（`activateApp()` 走 macOS 14+ API、`PASTETEST` 不再依賴 key window、`MUSE_KEYTEST` 跑完自結束） |
 | 0.18 | 儲存加固（壞檔備份 + 唯讀 + GUI 提示）、日誌落盤、`tools/update.sh`、`tools/release.sh`、`MUSE_STORE_BROKEN_TEST` |
 | 0.17 | 輸入焦點與貼上路徑（`pasteIntoPage`、`scheduleComposerFocus`） |
