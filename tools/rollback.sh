@@ -140,8 +140,11 @@ fi
 NEW_VER="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
   /Applications/MuseDock.app/Contents/Info.plist 2>/dev/null || echo '?')"
 step "啟動"
-[[ "$NEW_VER" == "$BUILT_VER" ]] && \
-  info "  ⚠️ 版本號沒變（都是 ${NEW_VER}）——若這是預期的（例如同一版重裝）可忽略"
+# 版本號只在發版時遞增：從 main 回到最新 tag、或重裝同一版，號碼都會一樣。
+# 真正該看的是「有沒有換成目標 commit」，版本號只是給人看的對照。
+if [[ "$NEW_VER" == "$BUILT_VER" ]]; then
+  info "  版本號同為 ${NEW_VER}（來源可能不同，例如 main → 最新 tag；版本號只在發版時遞增）"
+fi
 open -a MuseDock
 sleep 1
 if pgrep -x MuseDock >/dev/null 2>&1; then
